@@ -1,0 +1,364 @@
+//! Mounting and unmounting on Linux, through udisks2 (`udisksctl`) or plain `mount`.
+//!
+//! udisks2 mounts as the calling user, at the place the desktop would use
+//! (`/run/media/$USER/…` or `/media/$USER/…`) and without a password for removable drives.
+//! A drive udisks2 wants an administrator's password for (an internal one), a machine without
+//! udisks2, or a run as root (where udisks2 would use `/run/media/root`) is mounted at
+//! `<mount_base>/<uuid>` with `mount` instead, through the run's privileged helper.
+
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use crate::config::MountMethod;
+use crate::error::{Error, Result};
+use crate::escalate;
+use crate::privileged::{Op, Privileges};
+use crate::system::{BlockDevice, MountRequest, UnmountRequest};
+
+/// Directories udisks2 and similar automounters mount into ([`LinuxSystem`](crate::LinuxSystem)'s
+/// default `automount_dirs`).
+pub const AUTOMOUNT_DIRS: &[&str] = &["/run/media", "/media"];
+
+/// How a mount will actually be done once `auto` is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    Udisks,
+    Mount,
+}
+
+/// Whether udisks2 may ask for a password itself (a polkit prompt) or must refuse instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Polkit {
+    /// `mount_method = "udisks"`: udisks2 is what was asked for, its own prompt included.
+    MayAsk,
+    /// `auto`: a drive that needs a password is mounted the `mount` way instead, through the run's
+    /// one privileged helper, so a run never asks twice.
+    MustNotAsk,
+}
+
+/// Decides how to mount: `top_level` mounts always use `mount`, because udisks2 refuses to
+/// mount a device that is already mounted somewhere.
+pub fn choose(method: MountMethod, top_level: bool) -> Via {
+    match method {
+        _ if top_level => Via::Mount,
+        MountMethod::Udisks => Via::Udisks,
+        MountMethod::Mount => Via::Mount,
+        MountMethod::Auto if !escalate::is_root() && udisks_available() => Via::Udisks,
+        MountMethod::Auto => Via::Mount,
+    }
+}
+
+pub fn udisks_available() -> bool {
+    escalate::find_program("udisksctl").is_some()
+        && escalate::output(&[OsString::from("udisksctl"), OsString::from("status")])
+            .is_ok_and(|output| output.status.success())
+}
+
+pub fn mount(request: &MountRequest<'_>) -> Result<()> {
+    let device = request.device;
+    let fail = |message: String| Error::MountFailed { device: device.describe(), message };
+    match choose(request.method, request.top_level) {
+        Via::Udisks => {
+            if escalate::find_program("udisksctl").is_none() {
+                return Err(fail("udisks2 isn't installed (from `udisksctl`)".into()));
+            }
+            let polkit = if request.method == MountMethod::Udisks { Polkit::MayAsk } else { Polkit::MustNotAsk };
+            match escalate::run(&udisks_mount_argv(&device.devnode, &request.options, polkit)) {
+                Ok(()) => Ok(()),
+                Err(err) if polkit == Polkit::MustNotAsk && not_authorized(&err) => mount_into_base(request)
+                    .map_err(|err| fail(after_refusal("mounting it with `mount`", err))),
+                Err(err) => Err(fail(inner_message(err))),
+            }
+        }
+        Via::Mount => mount_into_base(request).map_err(|err| fail(inner_message(err))),
+    }
+}
+
+/// The `mount` method: at `<mount_base>/<uuid>`, made for it, and removed again if mounting fails.
+fn mount_into_base(request: &MountRequest<'_>) -> Result<()> {
+    let device = request.device;
+    let dir = mount_dir(&request.mount_base, device);
+    create_dir(&dir, request.privileges)?;
+    let options = mount_options(device, &request.options, request.top_level);
+    mount_as_root(&device.devnode, &dir, options, request.privileges).inspect_err(|_| {
+        // Don't leave an empty mount point behind.
+        let _ = remove_dir(&dir, request.privileges);
+    })
+}
+
+pub fn unmount(request: &UnmountRequest<'_>) -> Result<()> {
+    let mount_point = &request.mount.mount_point;
+    let fail = |message: String| Error::UnmountFailed { mount_point: mount_point.clone(), message };
+    if *mount_point == mount_dir(&request.mount_base, request.device) {
+        umount_as_root(mount_point, request.privileges).map_err(|err| fail(inner_message(err)))?;
+        let _ = remove_dir(mount_point, request.privileges);
+        Ok(())
+    } else if udisks_available() {
+        match escalate::run(&udisks_unmount_argv(&request.device.devnode, Polkit::MustNotAsk)) {
+            Ok(()) => Ok(()),
+            Err(err) if not_authorized(&err) => umount_as_root(mount_point, request.privileges)
+                .map_err(|err| fail(after_refusal("unmounting it with `umount`", err))),
+            Err(err) => Err(fail(inner_message(err))),
+        }
+    } else {
+        umount_as_root(mount_point, request.privileges).map_err(|err| fail(inner_message(err)))
+    }
+}
+
+/// `udisksctl mount --block-device <device> [--options <options>] [--no-user-interaction]`.
+pub fn udisks_mount_argv(device: &Path, options: &[String], polkit: Polkit) -> Vec<OsString> {
+    let mut argv = os_args(["udisksctl", "mount", "--block-device"]);
+    argv.push(device.into());
+    if !options.is_empty() {
+        argv.push("--options".into());
+        argv.push(options.join(",").into());
+    }
+    argv.extend(no_interaction(polkit));
+    argv
+}
+
+/// `udisksctl unmount --block-device <device> [--no-user-interaction]`.
+pub fn udisks_unmount_argv(device: &Path, polkit: Polkit) -> Vec<OsString> {
+    let mut argv = os_args(["udisksctl", "unmount", "--block-device"]);
+    argv.push(device.into());
+    argv.extend(no_interaction(polkit));
+    argv
+}
+
+fn no_interaction(polkit: Polkit) -> Option<OsString> {
+    match polkit {
+        Polkit::MayAsk => None,
+        Polkit::MustNotAsk => Some("--no-user-interaction".into()),
+    }
+}
+
+/// `mount [-o <options>] -- <device> <dir>`.
+pub fn mount_argv(device: &Path, dir: &Path, options: &[String]) -> Vec<OsString> {
+    let mut argv = vec![OsString::from("mount")];
+    if !options.is_empty() {
+        argv.push("-o".into());
+        argv.push(options.join(",").into());
+    }
+    argv.extend([OsString::from("--"), device.into(), dir.into()]);
+    argv
+}
+
+/// `umount -- <mount_point>`.
+pub fn umount_argv(mount_point: &Path) -> Vec<OsString> {
+    vec!["umount".into(), "--".into(), mount_point.into()]
+}
+
+/// Whether udisks2 refused for want of an authorization (an administrator's password).
+fn not_authorized(err: &Error) -> bool {
+    matches!(err, Error::CommandFailed { message, .. } if message.contains("NotAuthorized"))
+}
+
+/// `<mount_base>/<uuid>`, or `<mount_base>/<kernel name>` for devices without a usable UUID.
+pub fn mount_dir(base: &Path, device: &BlockDevice) -> PathBuf {
+    let name = device
+        .uuid
+        .as_deref()
+        .filter(|u| !u.is_empty() && u.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .map(str::to_owned)
+        .unwrap_or_else(|| device.kname.replace('/', "_"));
+    base.join(name)
+}
+
+/// The options for the `mount` method; a btrfs top-level mount needs `subvolid=5` unless the
+/// caller chose a subvolume explicitly.
+pub fn mount_options(device: &BlockDevice, options: &[String], top_level: bool) -> Vec<String> {
+    let mut out = options.to_vec();
+    let picks_subvolume = options.iter().flat_map(|o| o.split(',')).any(|o| o.starts_with("subvol"));
+    if top_level && device.fstype.as_deref() == Some("btrfs") && !picks_subvolume {
+        out.push("subvolid=5".into());
+    }
+    out
+}
+
+/// Whether `path` is a place devices get mounted on demand: inside an automounter's directory, or
+/// right below `mount_base`, where the `mount` method mounts ([`mount_dir`]). A devmount pointing at
+/// one may be re-pointed: it's a stale mount point, or another device's — one this device was
+/// swapped for.
+pub fn is_mount_location(path: &Path, mount_base: &Path, automount_dirs: &[PathBuf]) -> bool {
+    path.parent() == Some(mount_base) || in_automount_dir(path, automount_dirs)
+}
+
+/// Whether devmounts may unmount `mount_point`, a mount of `device`: one an automounter made, or
+/// the very one the `mount` method makes for that device ([`mount_dir`]). Any other mount — fstab's,
+/// the system's — is left alone, wherever `mount_base` is.
+pub fn may_unmount(mount_point: &Path, device: &BlockDevice, mount_base: &Path, automount_dirs: &[PathBuf]) -> bool {
+    mount_point == mount_dir(mount_base, device) || in_automount_dir(mount_point, automount_dirs)
+}
+
+fn in_automount_dir(path: &Path, automount_dirs: &[PathBuf]) -> bool {
+    automount_dirs.iter().any(|dir| path.starts_with(dir) && path != dir)
+}
+
+fn create_dir(dir: &Path, privileges: &Privileges) -> Result<()> {
+    let context = || format!("can't create {}", dir.display());
+    match fs::create_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => privileges
+            .request(&Op::CreateDir { dir: dir.to_owned() }, Error::io(context(), &err))?
+            .done(|message| Error::Io { context: context(), message }),
+        Err(err) => Err(Error::io(context(), &err)),
+    }
+}
+
+fn remove_dir(dir: &Path, privileges: &Privileges) -> Result<()> {
+    let context = || format!("can't remove {}", dir.display());
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => privileges
+            .request(&Op::RemoveDir { dir: dir.to_owned() }, Error::io(context(), &err))?
+            .done(|message| Error::Io { context: context(), message }),
+        Err(err) => Err(Error::io(context(), &err)),
+    }
+}
+
+fn mount_as_root(device: &Path, dir: &Path, options: Vec<String>, privileges: &Privileges) -> Result<()> {
+    let argv = mount_argv(device, dir, &options);
+    as_root(&argv, Op::Mount { options, device: device.to_owned(), dir: dir.to_owned() }, privileges)
+}
+
+fn umount_as_root(mount_point: &Path, privileges: &Privileges) -> Result<()> {
+    as_root(&umount_argv(mount_point), Op::Unmount { mount_point: mount_point.to_owned() }, privileges)
+}
+
+/// A step that needs root whatever the permissions (`mount`, `umount`): run directly when we are
+/// root, by the run's privileged helper otherwise.
+fn as_root(argv: &[OsString], op: Op, privileges: &Privileges) -> Result<()> {
+    if escalate::is_root() {
+        return escalate::run(argv);
+    }
+    let failed = |message: String| Error::CommandFailed { command: escalate::display_command(argv), message };
+    privileges.request(&op, failed("needs root, and privilege escalation is off".into()))?.done(failed)
+}
+
+fn os_args<const N: usize>(args: [&str; N]) -> Vec<OsString> {
+    args.iter().map(OsString::from).collect()
+}
+
+fn inner_message(err: Error) -> String {
+    match err {
+        Error::CommandFailed { command, message } => format!("{message} (from `{command}`)"),
+        other => other.to_string(),
+    }
+}
+
+/// Why the fallback for a drive udisks2 refused failed — said with the refusal, so the first of the
+/// two attempts isn't hidden by the second.
+fn after_refusal(fallback: &str, err: Error) -> String {
+    format!("udisks2 wants an administrator's password for it, and {fallback} instead failed: {}", inner_message(err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(fstype: &str, uuid: Option<&str>) -> BlockDevice {
+        BlockDevice {
+            kname: "sdb1".into(),
+            devnode: "/dev/sdb1".into(),
+            fstype: Some(fstype.into()),
+            uuid: uuid.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_commands_run_are_exactly_these() {
+        let words = |argv: Vec<OsString>| argv.into_iter().map(|a| a.into_string().unwrap()).collect::<Vec<_>>();
+        let dev = Path::new("/dev/sdb1");
+        let opts: Vec<String> = vec!["ro".into(), "noatime".into()];
+        assert_eq!(
+            words(udisks_mount_argv(dev, &opts, Polkit::MustNotAsk)),
+            ["udisksctl", "mount", "--block-device", "/dev/sdb1", "--options", "ro,noatime", "--no-user-interaction"]
+        );
+        assert_eq!(words(udisks_mount_argv(dev, &[], Polkit::MayAsk)), ["udisksctl", "mount", "--block-device", "/dev/sdb1"]);
+        assert_eq!(
+            words(udisks_unmount_argv(dev, Polkit::MustNotAsk)),
+            ["udisksctl", "unmount", "--block-device", "/dev/sdb1", "--no-user-interaction"]
+        );
+        assert_eq!(words(udisks_unmount_argv(dev, Polkit::MayAsk)), ["udisksctl", "unmount", "--block-device", "/dev/sdb1"]);
+        assert_eq!(
+            words(mount_argv(dev, Path::new("/run/devmounts/u"), &opts)),
+            ["mount", "-o", "ro,noatime", "--", "/dev/sdb1", "/run/devmounts/u"]
+        );
+        assert_eq!(words(mount_argv(dev, Path::new("/m"), &[])), ["mount", "--", "/dev/sdb1", "/m"]);
+        assert_eq!(words(umount_argv(Path::new("/-odd dir"))), ["umount", "--", "/-odd dir"]);
+    }
+
+    #[test]
+    fn udisks_refusing_for_want_of_a_password_is_told_apart() {
+        let refusal = |message: &str| Error::CommandFailed { command: "udisksctl mount".into(), message: message.into() };
+        assert!(not_authorized(&refusal(
+            "Error mounting /dev/sdb1: GDBus.Error:org.freedesktop.UDisks2.Error.NotAuthorizedCanObtain: Not authorized to perform operation"
+        )));
+        assert!(!not_authorized(&refusal("Error mounting /dev/sdb1: wrong fs type")));
+        assert!(!not_authorized(&Error::Io { context: "x".into(), message: "NotAuthorized".into() }));
+    }
+
+    #[test]
+    fn top_level_mounts_never_use_udisks() {
+        assert_eq!(choose(MountMethod::Udisks, true), Via::Mount);
+        assert_eq!(choose(MountMethod::Auto, true), Via::Mount);
+        assert_eq!(choose(MountMethod::Udisks, false), Via::Udisks);
+        assert_eq!(choose(MountMethod::Mount, false), Via::Mount);
+    }
+
+    #[test]
+    fn mount_dirs() {
+        let base = Path::new("/run/devmounts");
+        assert_eq!(mount_dir(base, &device("ext4", Some("46b4-89"))), Path::new("/run/devmounts/46b4-89"));
+        assert_eq!(mount_dir(base, &device("ext4", None)), Path::new("/run/devmounts/sdb1"));
+        assert_eq!(mount_dir(base, &device("ext4", Some("../../etc"))), Path::new("/run/devmounts/sdb1"));
+        assert_eq!(mount_dir(base, &device("ext4", Some(""))), Path::new("/run/devmounts/sdb1"));
+    }
+
+    #[test]
+    fn btrfs_top_level_option() {
+        let opts = |fstype: &str, given: &[&str], top: bool| {
+            let given: Vec<String> = given.iter().map(|s| s.to_string()).collect();
+            mount_options(&device(fstype, None), &given, top)
+        };
+        assert_eq!(opts("btrfs", &["ro"], true), ["ro", "subvolid=5"]);
+        assert_eq!(opts("btrfs", &["ro"], false), ["ro"]);
+        assert_eq!(opts("btrfs", &["ro,subvol=/@data"], true), ["ro,subvol=/@data"]);
+        assert_eq!(opts("ext4", &[], true), Vec::<String>::new());
+    }
+
+    fn automount_dirs() -> Vec<PathBuf> {
+        AUTOMOUNT_DIRS.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn mount_locations_are_automounter_dirs_and_right_below_the_base() {
+        let base = Path::new("/run/devmounts");
+        let at = |p: &str| is_mount_location(Path::new(p), base, &automount_dirs());
+        assert!(at("/run/media/u/X"));
+        assert!(at("/media/u/X"));
+        assert!(at("/run/devmounts/abc"));
+        assert!(!at("/run/devmounts/abc/deeper"), "the mount method only makes <base>/<name>");
+        assert!(!at("/run/media"));
+        assert!(!at("/run/devmounts"));
+        assert!(!at("/"));
+        assert!(!at("/home"));
+        assert!(!at("/mediafiles"));
+    }
+
+    #[test]
+    fn only_automounter_mounts_and_our_own_are_unmounted() {
+        let base = Path::new("/mnt");
+        let data = device("ext4", Some("46b4-89"));
+        let may = |p: &str| may_unmount(Path::new(p), &data, base, &automount_dirs());
+        assert!(may("/mnt/46b4-89"), "what the mount method made for this device");
+        assert!(may("/run/media/u/X"));
+        assert!(!may("/mnt/data"), "an fstab mount that happens to sit in mount_base");
+        assert!(!may("/mnt"));
+        assert!(!may("/"));
+        assert!(!may("/home"));
+    }
+}

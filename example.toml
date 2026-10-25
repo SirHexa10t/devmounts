@@ -1,0 +1,38 @@
+# An example configuration — every identifier in it is made up. Look before you leap:
+#   devmounts status example.toml      # what's there now
+#   devmounts --dry-run example.toml   # what applying it would do
+
+[settings]                       # every setting is optional; these are the defaults
+root = "/"                       # where the links are created
+automount = true                 # mount a listed device that isn't mounted
+mount_options = []               # options for every mount devmounts makes, e.g. ["noatime"]
+mount_method = "auto"            # auto | udisks | mount
+mount_base = "/run/devmounts"    # where the `mount` method mounts: <mount_base>/<uuid>
+escalate = "auto"                # auto | none | a command such as "sudo" or ["doas", "-n"]
+
+# A data drive, by its filesystem UUID: /data -> wherever it's mounted, and short links into it.
+[[device]]
+uuid = "11111111-2222-4333-8444-555555555555"
+devmount = "data"
+mounts = {
+    music = "media/music",       # /music -> /data/media/music
+    photos = "pictures/photos",
+    projects = "work/projects",
+}
+
+# A USB stick, by its label, mounted read-only when devmounts mounts it.
+[[device]]
+label = "STICK"
+devmount = "stick"
+mount_options = ["ro"]
+
+# A btrfs partition, by its GPT partition name, linked only while something else has it mounted.
+# Its root is the top-level subvolume, so subvolumes are directories.
+[[device]]
+partlabel = "storage"
+devmount = "storage"
+automount = false
+
+[device.mounts]                  # the same kind of table, written as a sub-table
+home_backup = "@backups/home"
+whole_disk = "."                 # one more link to the device root
