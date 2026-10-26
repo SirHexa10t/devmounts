@@ -102,7 +102,7 @@ fn run(
         config,
         options,
         system,
-        devices: RefCell::new(system.block_devices()?),
+        devices: RefCell::new(with_declared(system.block_devices()?, config)),
         automount_dirs: system.automount_dirs(),
         root,
         privileges: Privileges::new(
@@ -125,6 +125,18 @@ fn run(
         })
         .collect();
     Ok(Report { command, dry_run: options.dry_run, root: ctx.root, devices })
+}
+
+/// The devices as the system shows them, with what the config declares that the system can't
+/// show: a GELI provider (`geli = true`) is a container, its filesystem out of sight until it's
+/// attached.
+fn with_declared(mut devices: Vec<BlockDevice>, config: &Config) -> Vec<BlockDevice> {
+    for spec in config.devices.iter().filter(|spec| spec.geli) {
+        for device in devices.iter_mut().filter(|device| resolve::id_matches(&spec.id, device)) {
+            device.fstype = Some(resolve::GELI.into());
+        }
+    }
+    devices
 }
 
 /// Where the links go: [`Options::root`] (`--root`) over `settings.root` — refused when it isn't
@@ -251,13 +263,14 @@ impl Context<'_> {
         spec.automount(&self.config.settings) && !self.options.no_mount
     }
 
-    /// [`find`](Self::find), for `apply`: a device in a locked LUKS container — its filesystem out
-    /// of sight until the container is open — is unlocked on the way, when it may be mounted.
+    /// [`find`](Self::find), for `apply`: a device in a locked container devmounts opens itself
+    /// ([`resolve::UNLOCKABLE`]) — its filesystem out of sight until the container is open — is
+    /// unlocked on the way, when it may be mounted.
     fn open(&self, spec: &DeviceSpec, report: &mut DeviceReport) -> Opened {
         let found = resolve::find_device(&spec.id, &self.devices.borrow());
         let locked = match &found {
             Err(Error::InactiveContainer { device, fstype, .. })
-                if fstype == resolve::LUKS && self.may_mount(spec) =>
+                if resolve::UNLOCKABLE.contains(&fstype.as_str()) && self.may_mount(spec) =>
             {
                 self.devices.borrow().iter().find(|d| d.devnode == *device).cloned()
             }
@@ -273,8 +286,11 @@ impl Context<'_> {
             report.mount_changes.push(MountChange::WouldUnlock { container: devnode });
             return Opened::WouldUnlock;
         }
-        let request =
-            ContainerRequest { container: &container, method: self.config.settings.mount_method };
+        let request = ContainerRequest {
+            container: &container,
+            method: self.config.settings.mount_method,
+            privileges: &self.privileges,
+        };
         if let Err(err) = self.system.unlock(&request) {
             report.error = Some(err);
             return Opened::Nothing;
@@ -282,7 +298,7 @@ impl Context<'_> {
         report.mount_changes.push(MountChange::Unlocked { container: devnode });
         // What it opened shows only in the devices read again.
         match self.system.block_devices() {
-            Ok(devices) => *self.devices.borrow_mut() = devices,
+            Ok(devices) => *self.devices.borrow_mut() = with_declared(devices, self.config),
             Err(err) => {
                 report.error = Some(err);
                 return Opened::Nothing;
@@ -605,9 +621,11 @@ impl Context<'_> {
         }
     }
 
-    /// After `remove --unmount`: the device's LUKS containers locked again, innermost first (an
-    /// outer one can't close while one it holds is open), once none of its mounts is left — the
-    /// drive is then safe to unplug. One that something still mounts is left open, and said so.
+    /// After `remove --unmount`: the containers devmounts opens itself ([`resolve::UNLOCKABLE`])
+    /// locked again, innermost first (an outer one can't close while one it holds is open), once
+    /// none of the device's mounts is left — the drive is then safe to unplug. One that something
+    /// still mounts is left open, and said so. (A locked APFS volume is unlocked in place, so it's
+    /// no container of the device it becomes; macOS locks it again itself, on unmount.)
     fn lock_containers(&self, device: &ResolvedDevice, report: &mut DeviceReport) {
         // What stays mounted: what a dry run would leave (it unmounts nothing), or what's left.
         let remaining: Vec<PathBuf> = if self.options.dry_run {
@@ -619,9 +637,10 @@ impl Context<'_> {
         } else {
             report.mounted_at.iter().map(|mount| mount.mount_point.clone()).collect()
         };
-        let luks =
-            device.containers.iter().rev().filter(|c| c.fstype.as_deref() == Some(resolve::LUKS));
-        for container in luks {
+        let unlockable = |c: &&BlockDevice| {
+            c.fstype.as_deref().is_some_and(|fstype| resolve::UNLOCKABLE.contains(&fstype))
+        };
+        for container in device.containers.iter().rev().filter(unlockable) {
             let devnode = container.devnode.clone();
             let change = if !remaining.is_empty() {
                 MountChange::LeftUnlocked { container: devnode, mounted_at: remaining.clone() }
@@ -629,7 +648,8 @@ impl Context<'_> {
                 MountChange::WouldLock { container: devnode }
             } else {
                 let method = self.config.settings.mount_method;
-                match self.system.lock(&ContainerRequest { container, method }) {
+                let privileges = &self.privileges;
+                match self.system.lock(&ContainerRequest { container, method, privileges }) {
                     Ok(()) => MountChange::Locked { container: devnode },
                     Err(error) => MountChange::LockFailed { container: devnode, error },
                 }

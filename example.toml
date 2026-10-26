@@ -26,6 +26,8 @@ mounts = {
 label = "STICK"
 devmount = "stick"
 mount_options = ["ro"]
+# geli = true                    # FreeBSD: a GELI provider (named by partuuid or partlabel),
+#                                # attached when it may be mounted
 
 # A btrfs partition, by its GPT partition name, linked only while something else has it mounted.
 # Its root is the top-level subvolume, so subvolumes are directories.

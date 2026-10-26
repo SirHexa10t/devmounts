@@ -58,7 +58,8 @@ mounts = {                                      # /<name> -> /x/<path>
   in the file.
 - Multi-line `{ … }` tables (TOML 1.1) need commas between entries; `[device.mounts]`
   sub-tables work too.
-- Per device: `automount = false` (don't mount it if it isn't mounted), `mount_options`.
+- Per device: `automount = false` (don't mount it if it isn't mounted), `mount_options`,
+  and on FreeBSD `geli = true` (a GELI provider, [Platforms](#platforms)).
   Global defaults go in `[settings]`; [`example.toml`](example.toml) shows every setting.
   `root` and `mount_base` must be absolute paths without `..`. On macOS, `root` must be set,
   and can't be `/` ([Platforms](#platforms)).
@@ -120,7 +121,8 @@ As on Linux; [Platforms](#platforms) says how macOS and FreeBSD differ.
   container (its LUKS `uuid`, `partuuid` or `partlabel`): what's inside can't be seen while
   it's locked. `remove --unmount` locks it again once none of its mounts is left; one still
   mounted elsewhere is left unlocked, and the report says where. Other inactive containers
-  are reported with a hint (`mdadm --assemble`, `vgchange -ay`).
+  are reported with a hint (`mdadm --assemble`, `vgchange -ay`). macOS's locked APFS volumes
+  and FreeBSD's GELI providers are unlocked the same way ([Platforms](#platforms)).
 
 ## Privileges
 
@@ -129,9 +131,10 @@ your own needs nothing more. Steps that meet a permission error (a link in `/`, 
 `mount` and `umount`, which always need root, go to the run's privileged helper instead.
 The helper is devmounts itself, started through `sudo`, `doas` or `run0` (the first one
 found, or the `escalate` setting / `--escalate`) when a step first needs it, and kept for
-the rest of the run. So a run asks for a password at most once (udisks2's own prompts
-aside: a LUKS passphrase, and its authorization with `mount_method = "udisks"`), and not
-at all when nothing needs root. If the helper can't be started or the password is refused,
+the rest of the run. So a run asks for a password at most once (passphrases aside — a
+LUKS one, asked by udisks2, which may also ask for its authorization with
+`mount_method = "udisks"`, an APFS volume's, a GELI provider's), and not at all when
+nothing needs root. If the helper can't be started or the password is refused,
 each step that needed it says so (`can't get privileges: …`), and there's no second
 prompt. `escalate = "none"` never escalates, and those steps fail with their own error. As
 root, everything is done directly.
@@ -144,16 +147,17 @@ output written after those tools' documentation and source, and their system cal
 checked to compile (`cargo clippy --target aarch64-apple-darwin`, `x86_64-unknown-freebsd`).
 Expect rough edges there.
 
-|                       | Linux                         | macOS                        | FreeBSD                     |
-|-----------------------|-------------------------------|------------------------------|-----------------------------|
-| devices               | sysfs and udev (else `lsblk`) | `diskutil list`, `info`      | GEOM (`kern.geom.confxml`)  |
-| mount table           | `/proc/self/mountinfo`        | `getfsstat`                  | `getfsstat`                 |
-| `auto` mounts with    | udisks2, else `mount`         | `diskutil mount`             | `mount -t <type>`           |
-| automounters' dirs    | `/run/media`, `/media`        | `/Volumes`                   | `/media`                    |
-| default `mount_base`  | `/run/devmounts`              | `/private/var/run/devmounts` | `/var/run/devmounts`        |
-| default `root`        | `/`                           | none: name one               | `/`                         |
-| links swapped with    | `renameat2`                   | `renamex_np`                 | a check, then a rename      |
-| LUKS, `udisks` method | udisks2                       | –                            | –                           |
+|                      | Linux                         | macOS                         | FreeBSD                     |
+|----------------------|-------------------------------|-------------------------------|-----------------------------|
+| devices              | sysfs and udev (else `lsblk`) | `diskutil list`, `info`       | GEOM (`kern.geom.confxml`)  |
+| mount table          | `/proc/self/mountinfo`        | `getfsstat`                   | `getfsstat`                 |
+| `auto` mounts with   | udisks2, else `mount`         | `diskutil mount`              | `mount -t <type>`           |
+| automounters' dirs   | `/run/media`, `/media`        | `/Volumes`                    | `/media`                    |
+| default `mount_base` | `/run/devmounts`              | `/private/var/run/devmounts`  | `/var/run/devmounts`        |
+| default `root`       | `/`                           | none: name one                | `/`                         |
+| links swapped with   | `renameat2`                   | `renamex_np`                  | a check, then a rename      |
+| unlocks              | LUKS, with udisks2            | APFS volumes, with `diskutil` | GELI, declared, with `geli` |
+| `udisks` method      | yes                           | –                             | –                           |
 
 **macOS**
 
@@ -162,10 +166,15 @@ Expect rough edges there.
   a tab, `Users/me/links/x`), each is made at boot as a symlink to the link of that name.
 - `uuid` is the volume UUID macOS shows — for FAT and exFAT made from the serial number, so
   not Linux's `XXXX-XXXX`. `partuuid` is a partition's own UUID. No device has a
-  `partlabel`: `diskutil` doesn't show GPT partition names.
+  `partlabel`: `diskutil` doesn't show GPT partition names (a device named by one isn't
+  found, and the error says why).
 - `auto` mounts with `diskutil mount`, as the calling user, into `/Volumes` (`mount_options`
   passed as `-mountOptions`), and an automounter's mount comes down with `diskutil unmount`.
   `mount` is `mount -t` into `mount_base`, through the privileged helper.
+- A locked (encrypted) APFS volume is unlocked when it may be mounted, with
+  `diskutil apfs unlockVolume -nomount` as the calling user, which asks for the passphrase
+  on the terminal; then it's mounted the configured way. macOS locks it again itself when
+  it's unmounted, so `remove --unmount` has nothing more to do.
 
 **FreeBSD**
 
@@ -177,13 +186,19 @@ Expect rough edges there.
 - GEOM hides a device's label nodes while it's open under another name, so devmounts mounts
   a device through its label's node, which keeps the label visible. One that something else
   mounted through its own node (`/dev/da0p1`) can only be found by `partuuid` or `partlabel`
-  until it's unmounted.
+  until it's unmounted. Working within these limits is the config's to do; a device that
+  isn't found by its `uuid` or `label` says what FreeBSD doesn't show.
 - The filesystem type, which FreeBSD's `mount` needs, comes from the label node, else from
   the mount, else from the partition type (`freebsd-ufs` → `ufs`; `efi`, the FAT types and
   `ms-basic-data` → `msdosfs`; `linux-data` → `ext2fs`).
 - There's no udisks2: `auto` and `mount` both mount with `mount -t` into `mount_base`
   through the privileged helper, and `remove --unmount` takes autofs' mounts in `/media`
   down with `umount` too.
+- A GELI provider shows in GEOM only while it's attached, so a config declares one, named
+  by its `partuuid` or `partlabel`: `geli = true`. It's attached (`geli attach`, through the
+  privileged helper; `geli` asks for the passphrase on the terminal) when the device may be
+  mounted, and detached again by `remove --unmount`, like a LUKS container. An attached one
+  is followed to its `.eli` device without being declared.
 - Links are replaced with the check right before a plain rename: FreeBSD's `renameat2` came
   with 15.1 (exchanging two names with 15.2), and a program bound to it wouldn't start on a
   release before.

@@ -134,6 +134,9 @@ pub struct DeviceSpec {
     pub automount: Option<bool>,
     /// Per-device override of [`Settings::mount_options`].
     pub mount_options: Option<Vec<String>>,
+    /// The device is a GELI provider (FreeBSD), declared — GEOM shows one only while it's
+    /// attached: it's attached when it may be mounted, and detached again by `remove --unmount`.
+    pub geli: bool,
 }
 
 impl DeviceSpec {
@@ -348,6 +351,7 @@ struct RawDevice {
     mounts: IndexMap<String, String>,
     automount: Option<bool>,
     mount_options: Option<Vec<String>>,
+    geli: Option<bool>,
 }
 
 impl RawConfig {
@@ -367,7 +371,9 @@ impl RawConfig {
         let mut devices = Vec::new();
         for (index, raw) in self.device.into_iter().enumerate() {
             let at = format!("device #{}", index + 1);
-            let Some(device) = raw.validate(&at, in_slash, &mut problems) else { continue };
+            let Some(device) = raw.validate(&at, in_slash, platform, &mut problems) else {
+                continue;
+            };
             if !seen_ids.insert(device.id.normalized()) {
                 problems.push(format!("{at}: {} is listed more than once", device.id));
             }
@@ -446,7 +452,13 @@ impl RawSettings {
 }
 
 impl RawDevice {
-    fn validate(self, at: &str, in_slash: bool, problems: &mut Vec<String>) -> Option<DeviceSpec> {
+    fn validate(
+        self,
+        at: &str,
+        in_slash: bool,
+        platform: Platform,
+        problems: &mut Vec<String>,
+    ) -> Option<DeviceSpec> {
         let ids: Vec<DeviceId> = [
             self.uuid.map(DeviceId::Uuid),
             self.label.map(DeviceId::Label),
@@ -473,6 +485,16 @@ impl RawDevice {
 
         if let Some(options) = &self.mount_options {
             check_mount_options(&format!("{at}: mount_options"), options, problems);
+        }
+        let geli = self.geli.unwrap_or(false);
+        if geli && !platform.has_geli() {
+            problems
+                .push(format!("{at}: geli = true names FreeBSD's GELI, which only FreeBSD has"));
+        } else if geli && !matches!(id, DeviceId::PartUuid(_) | DeviceId::PartLabel(_)) {
+            problems.push(format!(
+                "{at}: a GELI provider is named by its partuuid or partlabel — nothing else of it \
+                 shows while it's detached"
+            ));
         }
 
         let devmount = match self.devmount {
@@ -507,6 +529,7 @@ impl RawDevice {
             mounts,
             automount: self.automount,
             mount_options: self.mount_options,
+            geli,
         })
     }
 }
@@ -613,6 +636,30 @@ mod tests {
         let config = Config::parse_for(&own, Platform::MacOs).unwrap();
         assert_eq!(config.settings.root, Path::new("/Users/me/links"));
         assert_eq!(config.settings.mount_base, Path::new("/private/var/run/devmounts"));
+    }
+
+    /// `geli = true` declares a GELI provider: on FreeBSD only, and by what shows of one while
+    /// it's detached — its partuuid or partlabel.
+    #[test]
+    fn a_geli_provider_is_declared_by_its_partition_on_freebsd() {
+        let declared = |id: &str| {
+            format!("[settings]\nroot = '/l'\n[[device]]\n{id}\ngeli = true\ndevmount = 'safe'\n")
+        };
+        let config = Config::parse_for(&declared("partlabel = 'safe'"), Platform::FreeBsd).unwrap();
+        assert!(config.devices[0].geli);
+        assert!(Config::parse_for(&declared("partuuid = 'p-1'"), Platform::FreeBsd).is_ok());
+        for id in ["uuid = '61b0c2d4e5f60718'", "label = 'safe'"] {
+            let problems = problems_on(Platform::FreeBsd, &declared(id));
+            assert_eq!(problems.len(), 1, "{id}: {problems:?}");
+            assert!(problems[0].contains("named by its partuuid or partlabel"), "{problems:?}");
+        }
+        for platform in [Platform::Linux, Platform::MacOs] {
+            let problems = problems_on(platform, &declared("partlabel = 'safe'"));
+            assert_eq!(problems.len(), 1, "{platform:?}: {problems:?}");
+            assert!(problems[0].contains("which only FreeBSD has"), "{problems:?}");
+        }
+        let undeclared = parse("[[device]]\npartlabel = 'safe'\ndevmount = 'safe'\n").unwrap();
+        assert!(!undeclared.devices[0].geli);
     }
 
     /// `udisks` names Linux's udisks2, so elsewhere it's refused, saying what works instead.

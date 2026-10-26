@@ -102,8 +102,9 @@ impl FakeSystem {
         *next
     }
 
-    /// A locked LUKS container, `container`, whose unlocking opens `inside` — stacked on it, as
-    /// dm-crypt's cleartext device is.
+    /// A locked container, `container`, whose unlocking opens `inside` — stacked on it, as
+    /// dm-crypt's cleartext device or GELI's `.eli` is, or, given the container's own kernel
+    /// name, the container itself unlocked in place, as an APFS volume is.
     pub fn add_locked(&self, container: BlockDevice, inside: BlockDevice) {
         self.locked.borrow_mut().insert(container.kname.clone(), inside);
         self.devices.borrow_mut().push(container);
@@ -225,8 +226,12 @@ impl System for FakeSystem {
         let mut devices = self.devices.borrow_mut();
         let held =
             devices.iter_mut().find(|d| d.kname == container.kname).expect("known container");
-        held.holders = vec![inside.kname.clone()];
-        devices.push(inside);
+        if inside.kname == container.kname {
+            *held = inside;
+        } else {
+            held.holders = vec![inside.kname.clone()];
+            devices.push(inside);
+        }
         Ok(())
     }
 

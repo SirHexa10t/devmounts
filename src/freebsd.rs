@@ -14,12 +14,18 @@
 //! to the next run, and a mount made through an alias is matched to the device under it
 //! ([`Geom::underlying_node`]). One mounted under another name can only be found by `partuuid` or
 //! `partlabel`.
+//!
+//! An attached GELI provider holds its `.eli` device, as a LUKS container holds its cleartext
+//! one; a detached one shows as the partition it is, unless the config declares it
+//! (`geli = true`). Attaching and detaching need root, so they go through the privileged helper.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::bsd::{self, Mounted};
 use crate::mountinfo::MountEntry;
+use crate::resolve::GELI;
 use crate::system::BlockDevice;
 use crate::xml::{self, Element};
 
@@ -47,7 +53,8 @@ pub struct Geom {
     /// Each alias (`msdosfs/NAME`, `gpt/NAME`, …) with the provider it's an alias of: a device, or
     /// another alias (a filesystem's label inside a glabel'd device).
     aliases: Vec<(String, String)>,
-    /// Each partition's `gpart` type (`freebsd-ufs`, `ms-basic-data`, …), by its name.
+    /// Each partition's `gpart` type (`freebsd-ufs`, `ms-basic-data`, …), by its name — and a
+    /// GELI provider's `.eli` device's, its partition's: it holds what the partition was made for.
     partition_types: HashMap<String, String>,
 }
 
@@ -140,8 +147,8 @@ impl Geom {
 }
 
 /// Reads GEOM's configuration: the providers of every class but `LABEL` are devices, `LABEL`'s
-/// are aliases of the provider their geom consumes. Withered providers — on their way out —
-/// count as gone.
+/// are aliases of the provider their geom consumes, and `ELI`'s are held by it. Withered
+/// providers — on their way out — count as gone.
 pub fn parse_confxml(text: &str) -> Result<Geom, String> {
     let mesh = xml::parse(text)?;
     if mesh.name != "mesh" {
@@ -149,7 +156,7 @@ pub fn parse_confxml(text: &str) -> Result<Geom, String> {
     }
     let mut geom = Geom::default();
     let mut names: HashMap<&str, String> = HashMap::new();
-    let mut label_geoms = Vec::new();
+    let (mut label_geoms, mut eli_geoms) = (Vec::new(), Vec::new());
     for class in named(&mesh, "class") {
         let class_name = text_of(class, "name");
         for gp in named(class, "geom").filter(|gp| gp.child("wither").is_none()) {
@@ -164,21 +171,40 @@ pub fn parse_confxml(text: &str) -> Result<Geom, String> {
                     geom.devices.push(device(&name, partition, config, &mut geom.partition_types));
                 }
             }
-            if class_name == "LABEL" {
-                label_geoms.push(gp);
+            match class_name.as_str() {
+                "LABEL" => label_geoms.push(gp),
+                "ELI" => eli_geoms.push(gp),
+                _ => {}
             }
         }
     }
     for gp in label_geoms {
-        let consumed =
-            gp.child("consumer").and_then(|c| c.child("provider")).and_then(|p| p.attribute("ref"));
-        let Some(of) = consumed.and_then(|id| names.get(id)) else { continue };
+        let Some(of) = consumed(gp, &names) else { continue };
         for provider in providers(gp) {
             geom.aliases.push((text_of(provider, "name"), of.clone()));
         }
     }
     geom.identify();
+    for gp in eli_geoms {
+        let Some(of) = consumed(gp, &names) else { continue };
+        for provider in providers(gp) {
+            let eli = text_of(provider, "name");
+            if let Some(part_type) = geom.partition_types.get(of).cloned() {
+                geom.partition_types.insert(eli.clone(), part_type);
+            }
+            if let Some(device) = geom.devices.iter_mut().find(|device| device.kname == *of) {
+                device.fstype = Some(GELI.into());
+                device.holders.push(eli);
+            }
+        }
+    }
     Ok(geom)
+}
+
+/// The name of the provider the geom `gp` consumes.
+fn consumed<'a>(gp: &Element, names: &'a HashMap<&str, String>) -> Option<&'a String> {
+    let id = gp.child("consumer")?.child("provider")?.attribute("ref")?;
+    names.get(id)
 }
 
 /// A device for the provider `name`, with what a partition's `config` says about it.
@@ -238,9 +264,28 @@ fn mbr_partuuid(efimedia: &str) -> Option<String> {
     (signature != 0).then(|| format!("{signature:08x}-{index:02x}"))
 }
 
+/// `geli attach <provider>`: `geli` asks for the passphrase on the terminal itself. (`provider`
+/// is a device node, `/dev/…`, which no option starts like.)
+pub fn geli_attach_argv(provider: &Path) -> Vec<OsString> {
+    vec!["geli".into(), "attach".into(), provider.into()]
+}
+
+/// `geli detach <provider>`.
+pub fn geli_detach_argv(provider: &Path) -> Vec<OsString> {
+    vec!["geli".into(), "detach".into(), provider.into()]
+}
+
 /// What a partition of `gpart` type `part_type` usually holds, for one that neither an alias nor
 /// a mount says more about: FreeBSD's own types, and for Windows' and EFI's, FAT — what removable
 /// drives mostly carry. (An NTFS or exFAT one then fails to mount, saying so.)
+//
+// TODO: verify the FAT guess on a real FreeBSD machine. Unknown: how often a `ms-basic-data`
+// (or MBR FAT/`ntfs`-typed) partition without a label node holds exFAT or NTFS instead — exFAT
+// has no label node at all, so it's always guessed — and how clearly `mount -t msdosfs` then
+// says why it failed. To find out, with FAT, exFAT and NTFS drives attached, labelled and not:
+// `gpart show -p` and `sysctl -n kern.geom.confxml` (what devmounts reads), `fstyp /dev/<part>`
+// as root (what each really holds), `devmounts devices` (what devmounts makes of them), then
+// `devmounts <config>` naming each by `partuuid`, to see the mount of a wrongly guessed one fail.
 pub fn fstype_for_partition_type(part_type: &str) -> Option<&'static str> {
     Some(match part_type {
         "freebsd-ufs" => "ufs",
@@ -267,6 +312,7 @@ mod native {
     use crate::mount;
     use crate::mountinfo::DevNum;
     use crate::platform::Platform;
+    use crate::privileged::Op;
     use crate::system::{self, ContainerRequest, MountRequest, System, UnmountRequest};
 
     /// The real machine, on FreeBSD.
@@ -406,14 +452,29 @@ mod native {
             mount::unmount_with_umount(request)
         }
 
+        /// `geli attach`, through the run's privileged helper (it needs root); `geli` asks for
+        /// the passphrase on the terminal itself.
         fn unlock(&self, request: &ContainerRequest<'_>) -> Result<()> {
-            let container = request.container.devnode.clone();
-            Err(Error::UnlockFailed { container, message: mount::LUKS_NEEDS_UDISKS.into() })
+            let provider = &request.container.devnode;
+            let op = Op::GeliAttach { provider: provider.clone() };
+            mount::as_root(&geli_attach_argv(provider), op, request.privileges).map_err(|err| {
+                Error::UnlockFailed {
+                    container: provider.clone(),
+                    message: mount::inner_message(err),
+                }
+            })
         }
 
+        /// `geli detach`, through the run's privileged helper.
         fn lock(&self, request: &ContainerRequest<'_>) -> Result<()> {
-            let container = request.container.devnode.clone();
-            Err(Error::LockFailed { container, message: mount::LUKS_NEEDS_UDISKS.into() })
+            let provider = &request.container.devnode;
+            let op = Op::GeliDetach { provider: provider.clone() };
+            mount::as_root(&geli_detach_argv(provider), op, request.privileges).map_err(|err| {
+                Error::LockFailed {
+                    container: provider.clone(),
+                    message: mount::inner_message(err),
+                }
+            })
         }
     }
 }
@@ -426,7 +487,8 @@ mod tests {
     /// `/` through its GPT label, so its other aliases withered — one of them caught going), a USB
     /// stick (MBR, FAT, labelled `STICK`) and a USB drive (GPT: a FAT partition named `Données`,
     /// mounted through its own node, so its label withered; ext2fs labelled `backup`; a glabel'd
-    /// UFS labelled `VAULT` inside; a UFS with only its id). Written the way `geom_dump.c` writes
+    /// UFS labelled `VAULT` inside; a UFS with only its id; a GELI provider named `safe`, attached,
+    /// with nothing on its `.eli` to name it). Written the way `geom_dump.c` writes
     /// it — a sample: no FreeBSD machine has been at hand to record one (see the README).
     const CONFXML: &str = "<mesh>
   <class id=\"0xffffffff81c2a6a0\">
@@ -731,6 +793,27 @@ mod tests {
 \t    <efimedia>HD(4,GPT,9b1f6d3e-5c4a-4e2b-8f7d-0123456789ae,0x89801000,0xc800000)</efimedia>
 \t  </config>
 \t</provider>
+\t<provider id=\"0xfffff80003f6e005\">
+\t  <geom ref=\"0xfffff80003f6e100\"/>
+\t  <mode>r1w1e1</mode>
+\t  <name>da1p5</name>
+\t  <mediasize>107374182400</mediasize>
+\t  <sectorsize>512</sectorsize>
+\t  <stripesize>4096</stripesize>
+\t  <stripeoffset>0</stripeoffset>
+\t  <config>
+\t    <start>2516584448</start>
+\t    <end>2726299647</end>
+\t    <index>5</index>
+\t    <type>freebsd-ufs</type>
+\t    <offset>1288491237376</offset>
+\t    <length>107374182400</length>
+\t    <label>safe</label>
+\t    <rawtype>516e7cb6-6ecf-11d6-8ff8-00022d09712b</rawtype>
+\t    <rawuuid>9b1f6d3e-5c4a-4e2b-8f7d-0123456789af</rawuuid>
+\t    <efimedia>HD(5,GPT,9b1f6d3e-5c4a-4e2b-8f7d-0123456789af,0x96001000,0xc800000)</efimedia>
+\t  </config>
+\t</provider>
     </geom>
   </class>
   <class id=\"0xffffffff81c2d2f0\">
@@ -992,6 +1075,42 @@ mod tests {
 \t</provider>
     </geom>
   </class>
+  <class id=\"0xffffffff81c2e410\">
+    <name>ELI</name>
+    <geom id=\"0xfffff80006a1e100\">
+      <class ref=\"0xffffffff81c2e410\"/>
+      <name>da1p5.eli</name>
+      <rank>3</rank>
+      <config>
+\t<KeysTotal>2</KeysTotal>
+\t<KeysAllocated>2</KeysAllocated>
+\t<Flags>NONE</Flags>
+\t<Version>7</Version>
+\t<Crypto>software</Crypto>
+\t<KeyLength>256</KeyLength>
+\t<EncryptionAlgorithm>AES-XTS</EncryptionAlgorithm>
+\t<State>ACTIVE</State>
+      </config>
+\t<consumer id=\"0xfffff80006a1e200\">
+\t  <geom ref=\"0xfffff80006a1e100\"/>
+\t  <provider ref=\"0xfffff80003f6e005\"/>
+\t  <mode>r1w1e1</mode>
+\t  <config>
+\t  </config>
+\t</consumer>
+\t<provider id=\"0xfffff80006a1e001\">
+\t  <geom ref=\"0xfffff80006a1e100\"/>
+\t  <mode>r0w0e0</mode>
+\t  <name>da1p5.eli</name>
+\t  <mediasize>107374178304</mediasize>
+\t  <sectorsize>4096</sectorsize>
+\t  <stripesize>0</stripesize>
+\t  <stripeoffset>0</stripeoffset>
+\t  <config>
+\t  </config>
+\t</provider>
+    </geom>
+  </class>
   <class id=\"0xffffffff81c2e300\">
     <name>DEV</name>
     <geom id=\"0xfffff80005a1e100\">
@@ -1047,14 +1166,25 @@ mod tests {
         assert_eq!(
             knames,
             [
-                "ada0", "da0", "da1", "ada0p1", "ada0p2", "ada0p3", "da0s1", "da1p1", "da1p2",
-                "da1p3", "da1p4"
+                "ada0",
+                "da0",
+                "da1",
+                "ada0p1",
+                "ada0p2",
+                "ada0p3",
+                "da0s1",
+                "da1p1",
+                "da1p2",
+                "da1p3",
+                "da1p4",
+                "da1p5",
+                "da1p5.eli"
             ]
         );
         for device in &devices {
             assert_eq!(device.devnode, Path::new("/dev").join(&device.kname));
-            let whole = ["ada0", "da0", "da1"].contains(&device.kname.as_str());
-            assert_eq!(device.partition, !whole, "{}", device.kname);
+            let partition = !["ada0", "da0", "da1", "da1p5.eli"].contains(&device.kname.as_str());
+            assert_eq!(device.partition, partition, "{}", device.kname);
         }
         let disk = get(&devices, "da1");
         assert_eq!((disk.fstype.as_deref(), disk.label.as_deref()), (None, None));
@@ -1099,6 +1229,34 @@ mod tests {
         assert_eq!(identity("ada0p3"), (Some("ufs"), None, None), "typed by its mount");
         assert_eq!(identity("da1p1"), (Some("msdosfs"), None, None), "typed by its mount");
         assert_eq!(identity("ada0p2"), (Some("swap"), None, None), "typed by its partition type");
+    }
+
+    /// An attached GELI provider holds its `.eli` device, as a LUKS container holds its cleartext
+    /// one — found by the partition's name, which shows while its aliases are withered — and the
+    /// `.eli` device holds what the partition was made for.
+    #[test]
+    fn an_attached_geli_provider_holds_its_eli_device() {
+        let devices = devices();
+        let provider = get(&devices, "da1p5");
+        assert_eq!(provider.fstype.as_deref(), Some(GELI));
+        assert_eq!(provider.holders, ["da1p5.eli"]);
+        assert_eq!(provider.partlabel.as_deref(), Some("safe"));
+        let eli = get(&devices, "da1p5.eli");
+        assert_eq!(eli.fstype.as_deref(), Some("ufs"));
+        let safe = crate::DeviceId::PartLabel("safe".into());
+        let found = crate::resolve::find_device(&safe, &devices).unwrap();
+        assert_eq!(found.device.kname, "da1p5.eli", "followed into the .eli");
+        assert_eq!(found.containers, std::slice::from_ref(provider));
+    }
+
+    #[test]
+    fn geli_command_lines() {
+        let args = |argv: Vec<OsString>| {
+            argv.into_iter().map(|a| a.into_string().unwrap()).collect::<Vec<_>>()
+        };
+        let provider = Path::new("/dev/da1p5");
+        assert_eq!(args(geli_attach_argv(provider)), ["geli", "attach", "/dev/da1p5"]);
+        assert_eq!(args(geli_detach_argv(provider)), ["geli", "detach", "/dev/da1p5"]);
     }
 
     /// A mount through an alias is the device's — whatever alias it went through — and one through

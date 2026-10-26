@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use common::{FakeSystem, device, mkdir, tmpdir};
 use devmounts::engine::link_root;
 use devmounts::{
-    Colors, Config, Error, Escalation, LinkOutcome, LinkReport, MountChange, Options, Platform,
-    Report,
+    BlockDevice, Colors, Config, Error, Escalation, LinkOutcome, LinkReport, MountChange, Options,
+    Platform, Report,
 };
 use tempfile::TempDir;
 
@@ -796,6 +796,97 @@ fn remove_unmount_locks_the_container_once_its_last_mount_is_down() {
     assert!(report.ok(), "{}", report.render(Colors::Plain));
     let status = devmounts::status(&config, &opts(), &s.sys).unwrap();
     assert_eq!(status.devices[0].error.as_ref().map(Error::kind), Some("inactive_container"));
+}
+
+/// A GELI provider, declared: the partition `sdf1`, named `safe` — to the inventory the UFS it
+/// was made for while it's detached — whose attaching opens `sdf1.eli`, holding `docs/`.
+/// Returns where the `mount` method will mount that.
+fn add_geli(s: &Setup) -> PathBuf {
+    let provider = BlockDevice {
+        partlabel: Some("safe".into()),
+        uuid: None,
+        ..device("sdf1", 8, 81, "ufs", "", None)
+    };
+    s.sys.add_locked(provider, device("sdf1.eli", 8, 82, "ufs", "uuid-safe", None));
+    let inside = s.mnt.join("uuid-safe");
+    mkdir(&inside, "docs");
+    inside
+}
+
+/// A config for the `safe` partition, read as on FreeBSD — declaring it a GELI provider or not.
+fn safe_config(s: &Setup, geli: bool) -> Config {
+    let text = format!(
+        "[settings]\nroot = {:?}\nmount_base = {:?}\n[[device]]\npartlabel = 'safe'\n\
+         geli = {geli}\ndevmount = 'safe'\nmounts = {{ docs = 'docs' }}\n",
+        s.root, s.mnt
+    );
+    Config::parse_for(&text, Platform::FreeBsd).unwrap()
+}
+
+/// A declared GELI provider — to the inventory the partition it is, while it's detached — is
+/// attached on the way to its device, which is mounted and linked; `remove --unmount` detaches it
+/// again once its last mount is down.
+#[test]
+fn a_declared_geli_provider_is_attached_on_the_way_and_detached_after() {
+    let s = Setup::new();
+    let inside = add_geli(&s);
+    let config = safe_config(&s, true);
+    let report = s.apply(&config, &opts());
+    assert_eq!(*s.sys.calls.borrow(), ["unlock sdf1", "mount sdf1.eli [] top_level=false"]);
+    assert_eq!(report.devices[0].containers, ["/dev/sdf1 (geli)"]);
+    assert_eq!(read_link(&s.link("safe")), inside);
+    assert!(report.ok(), "{}", report.render(Colors::Plain));
+    s.sys.calls.borrow_mut().clear();
+    let removed = devmounts::remove(&config, &Options { unmount: true, ..opts() }, &s.sys).unwrap();
+    assert_eq!(
+        *s.sys.calls.borrow(),
+        [format!("unmount {}", inside.display()), "lock sdf1".to_owned()]
+    );
+    assert!(removed.ok(), "{}", removed.render(Colors::Plain));
+}
+
+/// Where it may not be mounted, a declared GELI provider stays detached: the device's problem,
+/// saying how to attach it.
+#[test]
+fn a_declared_geli_provider_stays_detached_where_mounting_is_off() {
+    let s = Setup::new();
+    add_geli(&s);
+    let report = devmounts::status(&safe_config(&s, true), &opts(), &s.sys).unwrap();
+    let error = report.devices[0].error.as_ref().expect("a problem");
+    assert_eq!(error.kind(), "inactive_container");
+    assert!(error.to_string().contains("geli attach /dev/sdf1"), "{error}");
+    assert!(s.sys.calls.borrow().is_empty());
+}
+
+/// Undeclared, the same provider is the partition it looks like — mounted as that, never
+/// attached: what GEOM doesn't show, the config says.
+#[test]
+fn an_undeclared_geli_provider_is_the_partition_it_looks_like() {
+    let s = Setup::new();
+    add_geli(&s);
+    s.apply(&safe_config(&s, false), &opts());
+    assert_eq!(*s.sys.calls.borrow(), ["mount sdf1 [] top_level=false"]);
+}
+
+/// A locked APFS volume is unlocked in place on the way — the same device, APFS then — and
+/// mounted and linked; nothing locks it after `remove --unmount`, as macOS does on unmount.
+#[test]
+fn a_locked_apfs_volume_is_unlocked_in_place() {
+    let s = Setup::new();
+    let volume = |fstype| device("sdg1", 8, 97, fstype, "uuid-apfs", Some("Backup"));
+    s.sys.add_locked(volume("apfs_locked"), volume("apfs"));
+    let inside = s.mnt.join("uuid-apfs");
+    mkdir(&inside, "docs");
+    let config = s.config(&s.device("label = 'Backup'", "backup", "docs = 'docs'"));
+    let report = s.apply(&config, &opts());
+    assert_eq!(*s.sys.calls.borrow(), ["unlock sdg1", "mount sdg1 [] top_level=false"]);
+    let unlocked = MountChange::Unlocked { container: "/dev/sdg1".into() };
+    assert_eq!(report.devices[0].mount_changes[0], unlocked);
+    assert!(report.devices[0].containers.is_empty(), "it's the device itself");
+    assert_eq!(read_link(&s.link("backup")), inside);
+    s.sys.calls.borrow_mut().clear();
+    devmounts::remove(&config, &Options { unmount: true, ..opts() }, &s.sys).unwrap();
+    assert_eq!(*s.sys.calls.borrow(), [format!("unmount {}", inside.display())]);
 }
 
 /// A dry run says it would lock the container, as the unmounts it would make leave nothing.

@@ -7,6 +7,10 @@
 //! What filesystem a partition holds only `diskutil info -plist <disk>` says, so each partition,
 //! and each disk without a partition map, is asked about once; an APFS volume is APFS by what it
 //! is. Neither shows a GPT partition's name, so on macOS no device has a `partlabel`.
+//!
+//! Which APFS volumes are encrypted and locked, `diskutil apfs list -plist` says. A locked one
+//! ([`APFS_LOCKED`]) is unlocked in place with `diskutil apfs unlockVolume`, which asks for the
+//! passphrase on the terminal itself; macOS locks it again when it's unmounted.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -14,6 +18,7 @@ use std::path::Path;
 #[cfg(any(target_os = "macos", test))]
 use crate::config::MountMethod;
 use crate::plist::Value;
+use crate::resolve::APFS_LOCKED;
 use crate::system::BlockDevice;
 
 /// `diskutil list -plist`.
@@ -24,6 +29,26 @@ pub fn list_argv() -> Vec<OsString> {
 /// `diskutil info -plist <disk>`.
 pub fn info_argv(disk: &str) -> Vec<OsString> {
     ["diskutil", "info", "-plist", disk].map(OsString::from).to_vec()
+}
+
+/// `diskutil apfs list -plist`.
+pub fn apfs_list_argv() -> Vec<OsString> {
+    ["diskutil", "apfs", "list", "-plist"].map(OsString::from).to_vec()
+}
+
+/// `diskutil apfs unlockVolume <volume> -nomount`: devmounts mounts it then, the configured way.
+/// `diskutil` asks for the passphrase on the terminal itself.
+pub fn diskutil_unlock_argv(volume: &Path) -> Vec<OsString> {
+    let mut argv = ["diskutil", "apfs", "unlockVolume"].map(OsString::from).to_vec();
+    argv.extend([volume.into(), "-nomount".into()]);
+    argv
+}
+
+/// `diskutil apfs lockVolume <volume>`.
+pub fn diskutil_lock_argv(volume: &Path) -> Vec<OsString> {
+    let mut argv = ["diskutil", "apfs", "lockVolume"].map(OsString::from).to_vec();
+    argv.push(volume.into());
+    argv
 }
 
 /// `diskutil mount [-mountOptions <options>] <device>`: into `/Volumes`, as the calling user.
@@ -43,11 +68,13 @@ pub fn diskutil_unmount_argv(mount_point: &Path) -> Vec<OsString> {
 }
 
 /// The devices a `diskutil list -plist` describes, in its order: each whole disk, then its
-/// partitions or, for an APFS container, its volumes. `fstype` says what filesystem the disk it's
-/// given holds — a partition, or a disk without a partition map — as [`filesystem_type`] reads it
-/// from `diskutil info -plist`.
+/// partitions or, for an APFS container, its volumes — those in `locked` ([`locked_volumes`])
+/// typed [`APFS_LOCKED`]. `fstype` says what filesystem the disk it's given holds — a
+/// partition, or a disk without a partition map — as [`filesystem_type`] reads it from
+/// `diskutil info -plist`.
 pub fn devices(
     list: &Value,
+    locked: &[String],
     mut fstype: impl FnMut(&str) -> std::result::Result<Option<String>, String>,
 ) -> std::result::Result<Vec<BlockDevice>, String> {
     let disks = list
@@ -70,10 +97,23 @@ pub fn devices(
             devices.push(partition);
         }
         for entry in volumes {
-            devices.push(BlockDevice { fstype: Some("apfs".into()), ..device(entry, false)? });
+            let volume = device(entry, false)?;
+            let fstype = if locked.contains(&volume.kname) { APFS_LOCKED } else { "apfs" };
+            devices.push(BlockDevice { fstype: Some(fstype.into()), ..volume });
         }
     }
     Ok(devices)
+}
+
+/// The APFS volumes a `diskutil apfs list -plist` says are locked: of every container's
+/// `Volumes`, those with `Locked` true.
+pub fn locked_volumes(apfs_list: &Value) -> Vec<String> {
+    let containers = apfs_list.get("Containers").and_then(Value::as_array).unwrap_or_default();
+    let volumes = containers.iter().flat_map(|container| entries(container, "Volumes"));
+    volumes
+        .filter(|volume| volume.get("Locked").and_then(Value::as_bool) == Some(true))
+        .filter_map(|volume| text(volume, "DeviceIdentifier"))
+        .collect()
 }
 
 /// The filesystem `diskutil info -plist` says a disk holds: its `FilesystemType` (`apfs`, `hfs`,
@@ -188,7 +228,14 @@ mod native {
         fn block_devices(&self) -> Result<Vec<BlockDevice>> {
             let inventory = |message: String| Error::Inventory { message };
             let list = plist_output(&list_argv()).map_err(inventory)?;
-            let mut devices = devices(&list, |disk| {
+            let locked = locked_volumes(&plist_output(&apfs_list_argv()).map_err(inventory)?);
+            // TODO: measure what this costs on a real Mac (`time devmounts devices`, with an
+            // external drive or two attached): one `diskutil info -plist` per partition, and per
+            // disk without a partition map, each a process of its own that asks Disk Arbitration.
+            // If it's slow, ask about every disk at once — `diskutil info -plist -all`, should it
+            // print something readable — or ask Disk Arbitration in-process
+            // (`DADiskCopyDescription`, its `DAVolumeKind`), at the cost of FFI.
+            let mut devices = devices(&list, &locked, |disk| {
                 plist_output(&info_argv(disk)).map(|info| filesystem_type(&info))
             })
             .map_err(inventory)?;
@@ -238,14 +285,26 @@ mod native {
             })
         }
 
+        /// A locked APFS volume, unlocked in place as the calling user — on the terminal, where
+        /// `diskutil` asks for the passphrase ([`escalate::run_on_terminal`]), so the passphrase
+        /// never passes through devmounts.
         fn unlock(&self, request: &ContainerRequest<'_>) -> Result<()> {
-            let container = request.container.devnode.clone();
-            Err(Error::UnlockFailed { container, message: mount::LUKS_NEEDS_UDISKS.into() })
+            let volume = &request.container.devnode;
+            escalate::run_on_terminal(&diskutil_unlock_argv(volume)).map_err(|err| {
+                Error::UnlockFailed {
+                    container: volume.clone(),
+                    message: format!("{} — its reason is above", mount::inner_message(err)),
+                }
+            })
         }
 
+        /// Locks an APFS volume again — which no run asks for, as macOS locks it on unmount.
         fn lock(&self, request: &ContainerRequest<'_>) -> Result<()> {
-            let container = request.container.devnode.clone();
-            Err(Error::LockFailed { container, message: mount::LUKS_NEEDS_UDISKS.into() })
+            let volume = &request.container.devnode;
+            escalate::run(&diskutil_lock_argv(volume)).map_err(|err| Error::LockFailed {
+                container: volume.clone(),
+                message: mount::inner_message(err),
+            })
         }
     }
 }
@@ -426,6 +485,55 @@ mod tests {
 </plist>
 "#;
 
+    /// A `diskutil apfs list -plist` of the same Mac, cut down to the keys read: its data volume
+    /// unlocked by FileVault at login, its `Backup & Co` volume encrypted and locked. (The shape
+    /// is BootUnlock's, which reads these keys; the values are made up.)
+    const APFS_LIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Containers</key>
+	<array>
+		<dict>
+			<key>ContainerReference</key>
+			<string>disk3</string>
+			<key>Volumes</key>
+			<array>
+				<dict>
+					<key>APFSVolumeUUID</key>
+					<string>5D8E6E5A-1111-4111-8111-111111111111</string>
+					<key>DeviceIdentifier</key>
+					<string>disk3s1</string>
+					<key>Encryption</key>
+					<true/>
+					<key>FileVault</key>
+					<true/>
+					<key>Locked</key>
+					<false/>
+					<key>Name</key>
+					<string>Macintosh HD - Data</string>
+				</dict>
+				<dict>
+					<key>APFSVolumeUUID</key>
+					<string>7F00AA55-2222-4222-8222-222222222222</string>
+					<key>DeviceIdentifier</key>
+					<string>disk3s5</string>
+					<key>Encryption</key>
+					<true/>
+					<key>FileVault</key>
+					<false/>
+					<key>Locked</key>
+					<true/>
+					<key>Name</key>
+					<string>Backup &amp; Co</string>
+				</dict>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
+"#;
+
     /// A `diskutil info -plist disk4s1`, cut down to a few of its many keys.
     const INFO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -455,7 +563,7 @@ mod tests {
 
     fn listed(fstypes: &[(&str, Option<&str>)]) -> (Vec<BlockDevice>, Vec<String>) {
         let mut asked = Vec::new();
-        let devices = devices(&plist::parse(LIST).unwrap(), |disk| {
+        let devices = devices(&plist::parse(LIST).unwrap(), &[], |disk| {
             asked.push(disk.to_owned());
             let fstype = fstypes.iter().find(|(d, _)| *d == disk).and_then(|(_, t)| *t);
             Ok(fstype.map(str::to_owned))
@@ -521,15 +629,41 @@ mod tests {
 
     #[test]
     fn an_unreadable_list_is_an_error() {
-        let failing = devices(&plist::parse(LIST).unwrap(), |disk| Err(format!("{disk}: gone")));
+        let failing =
+            devices(&plist::parse(LIST).unwrap(), &[], |disk| Err(format!("{disk}: gone")));
         assert_eq!(failing.unwrap_err(), "disk4s1: gone", "a failed question fails the listing");
         let empty = plist::parse("<plist><dict/></plist>").unwrap();
-        assert!(devices(&empty, |_| Ok(None)).unwrap_err().contains("AllDisksAndPartitions"));
+        assert!(devices(&empty, &[], |_| Ok(None)).unwrap_err().contains("AllDisksAndPartitions"));
         let nameless = plist::parse(
             "<plist><dict><key>AllDisksAndPartitions</key><array><dict/></array></dict></plist>",
         )
         .unwrap();
-        assert!(devices(&nameless, |_| Ok(None)).unwrap_err().contains("DeviceIdentifier"));
+        assert!(devices(&nameless, &[], |_| Ok(None)).unwrap_err().contains("DeviceIdentifier"));
+    }
+
+    /// A locked APFS volume is a container to unlock — in place: it's the device itself — and the
+    /// lookup says how; an unlocked one is APFS like any other.
+    #[test]
+    fn a_locked_apfs_volume_is_one_to_unlock() {
+        let locked = locked_volumes(&plist::parse(APFS_LIST).unwrap());
+        assert_eq!(locked, ["disk3s5"]);
+        let devices = devices(&plist::parse(LIST).unwrap(), &locked, |_| Ok(None)).unwrap();
+        let fstype =
+            |kname: &str| devices.iter().find(|d| d.kname == kname).unwrap().fstype.clone();
+        assert_eq!(fstype("disk3s5").as_deref(), Some(APFS_LOCKED));
+        assert_eq!(fstype("disk3s1").as_deref(), Some("apfs"));
+        let backup = crate::DeviceId::Label("Backup & Co".into());
+        match crate::resolve::find_device(&backup, &devices) {
+            Err(crate::Error::InactiveContainer { device, fstype, hint }) => {
+                assert_eq!(
+                    (device.as_path(), fstype.as_str()),
+                    (Path::new("/dev/disk3s5"), APFS_LOCKED)
+                );
+                assert!(hint.contains("diskutil apfs unlockVolume /dev/disk3s5"), "{hint}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(locked_volumes(&plist::parse("<plist><dict/></plist>").unwrap()).is_empty());
     }
 
     #[test]
@@ -547,6 +681,16 @@ mod tests {
         };
         assert_eq!(args(list_argv()), ["diskutil", "list", "-plist"]);
         assert_eq!(args(info_argv("disk4s1")), ["diskutil", "info", "-plist", "disk4s1"]);
+        assert_eq!(args(apfs_list_argv()), ["diskutil", "apfs", "list", "-plist"]);
+        let volume = Path::new("/dev/disk3s5");
+        assert_eq!(
+            args(diskutil_unlock_argv(volume)),
+            ["diskutil", "apfs", "unlockVolume", "/dev/disk3s5", "-nomount"]
+        );
+        assert_eq!(
+            args(diskutil_lock_argv(volume)),
+            ["diskutil", "apfs", "lockVolume", "/dev/disk3s5"]
+        );
         let disk = Path::new("/dev/disk4s1");
         assert_eq!(args(diskutil_mount_argv(disk, &[])), ["diskutil", "mount", "/dev/disk4s1"]);
         assert_eq!(

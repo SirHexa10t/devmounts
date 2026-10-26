@@ -1,5 +1,5 @@
 //! The run's privileged helper. Every step that needs root — a link in `/`, `mount`, `umount`, a
-//! mount point under `mount_base` — goes through one helper process, started with the escalation
+//! mount point under `mount_base`, `geli` — goes through one helper process, started with the escalation
 //! command the first time a step needs it and kept for the rest of the run. However many steps a
 //! run takes, it asks for a password at most once.
 //!
@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::escalate::{self, Escalation};
+use crate::freebsd;
 use crate::link::{self, Placed};
 use crate::mount;
 
@@ -68,6 +69,17 @@ pub enum Op {
         #[serde(with = "bytes")]
         mount_point: PathBuf,
     },
+    /// Attach the GELI provider `provider` ([`freebsd::geli_attach_argv`]); `geli` asks for the
+    /// passphrase on the terminal itself.
+    GeliAttach {
+        #[serde(with = "bytes")]
+        provider: PathBuf,
+    },
+    /// Detach the GELI provider `provider` ([`freebsd::geli_detach_argv`]).
+    GeliDetach {
+        #[serde(with = "bytes")]
+        provider: PathBuf,
+    },
 }
 
 /// How a step went.
@@ -97,6 +109,8 @@ impl Op {
                 return run(&mount::mount_argv(device, dir, fstype.as_deref(), options));
             }
             Op::Unmount { mount_point } => return run(&mount::umount_argv(mount_point)),
+            Op::GeliAttach { provider } => return run(&freebsd::geli_attach_argv(provider)),
+            Op::GeliDetach { provider } => return run(&freebsd::geli_detach_argv(provider)),
         };
         outcome.unwrap_or_else(|err| Reply::Failed { message: err.to_string() })
     }
@@ -307,7 +321,9 @@ mod tests {
                 device: "/dev/sdb1".into(),
                 dir: odd.clone(),
             },
-            Op::Unmount { mount_point: odd },
+            Op::Unmount { mount_point: odd.clone() },
+            Op::GeliAttach { provider: odd.clone() },
+            Op::GeliDetach { provider: odd },
         ];
         for op in ops {
             let line = serde_json::to_string(&op).unwrap();

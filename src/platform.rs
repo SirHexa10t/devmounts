@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::config::DeviceId;
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 compile_error!("devmounts runs on Linux, macOS and FreeBSD");
 
@@ -59,12 +61,41 @@ impl Platform {
         }
     }
 
+    /// What this system can't show of the device `id` names, said when no device matches it: on
+    /// FreeBSD a UUID but UFS's, and a label while the device is mounted under another name; on
+    /// macOS a GPT partition's name. Working within that is the config's to do.
+    pub fn identifier_hint(self, id: &DeviceId) -> Option<&'static str> {
+        match (self, id) {
+            (Platform::FreeBsd, DeviceId::Uuid(_)) => Some(
+                "FreeBSD shows a UUID only for UFS, its ufsid: name a FAT, ext2/3/4 or NTFS \
+                 filesystem by its label, partuuid or partlabel",
+            ),
+            (Platform::FreeBsd, DeviceId::Label(_)) => Some(
+                "FreeBSD hides a device's label while it's mounted under another name; its \
+                 partuuid or partlabel finds it either way",
+            ),
+            (Platform::MacOs, DeviceId::PartLabel(_)) => Some(
+                "macOS doesn't show GPT partition names: name the device by its uuid, label or \
+                 partuuid",
+            ),
+            _ => None,
+        }
+    }
+
     /// Whether `mount` must be told the filesystem's type (`-t`): macOS's refuses to go on
     /// without one, FreeBSD's takes UFS for granted, Linux's finds it out.
     pub fn mount_needs_type(self) -> bool {
         match self {
             Platform::Linux => false,
             Platform::MacOs | Platform::FreeBsd => true,
+        }
+    }
+
+    /// Whether GELI, which `geli = true` names, is this system's.
+    pub fn has_geli(self) -> bool {
+        match self {
+            Platform::FreeBsd => true,
+            Platform::Linux | Platform::MacOs => false,
         }
     }
 
@@ -95,6 +126,27 @@ mod tests {
             assert!(!dirs.is_empty(), "{platform:?}");
             assert!(dirs.iter().all(|dir| below_slash(Path::new(dir))), "{platform:?}: {dirs:?}");
         }
+    }
+
+    /// Where a system can't show what an identifier names, a miss says so — and only there.
+    #[test]
+    fn what_a_system_cannot_show_is_said_where_a_device_is_missed() {
+        let ids = [
+            DeviceId::Uuid("1234-ABCD".into()),
+            DeviceId::Label("X".into()),
+            DeviceId::PartUuid("6c9fd5a1-01".into()),
+            DeviceId::PartLabel("data".into()),
+        ];
+        let said = |platform: Platform| -> Vec<bool> {
+            ids.iter().map(|id| platform.identifier_hint(id).is_some()).collect()
+        };
+        assert_eq!(said(Platform::Linux), [false, false, false, false]);
+        assert_eq!(said(Platform::FreeBsd), [true, true, false, false]);
+        assert_eq!(said(Platform::MacOs), [false, false, false, true]);
+        let hint = |platform: Platform, id: usize| platform.identifier_hint(&ids[id]).unwrap();
+        assert!(hint(Platform::FreeBsd, 0).contains("only for UFS"));
+        assert!(hint(Platform::FreeBsd, 1).contains("mounted under another name"));
+        assert!(hint(Platform::MacOs, 3).contains("GPT partition names"));
     }
 
     /// macOS refuses `/` — and says how names can be put there by hand — and nothing else.

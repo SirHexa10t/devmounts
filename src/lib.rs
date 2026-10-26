@@ -36,6 +36,7 @@ pub mod error;
 pub mod escalate;
 pub mod freebsd;
 pub mod link;
+pub mod linux;
 pub mod macos;
 pub mod mount;
 pub mod mountinfo;
@@ -53,6 +54,7 @@ pub use engine::{DeviceListing, Options, apply, list_devices, remove, status};
 pub use error::{Error, Result};
 pub use escalate::Escalation;
 pub use link::LinkState;
+pub use linux::LinuxSystem;
 pub use mountinfo::{DevNum, MountEntry};
 pub use platform::Platform;
 pub use privileged::Privileges;
@@ -63,5 +65,5 @@ pub use resolve::{
     Location, MountTree, ResolvedDevice, check_target, device_mounts, find_device, locate,
 };
 pub use system::{
-    BlockDevice, ContainerRequest, LinuxSystem, MountRequest, NativeSystem, System, UnmountRequest,
+    BlockDevice, ContainerRequest, MountRequest, NativeSystem, System, UnmountRequest,
 };

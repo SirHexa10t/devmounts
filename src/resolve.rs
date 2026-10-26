@@ -11,13 +11,29 @@ use serde::Serialize;
 use crate::config::{DeviceId, DevicePath};
 use crate::error::{Error, Result};
 use crate::mountinfo::{DevNum, MountEntry};
+use crate::platform::Platform;
 use crate::system::BlockDevice;
 
-/// Types whose contents only become mountable through a device stacked on top.
-const CONTAINERS: &[&str] = &[LUKS, "BitLocker", "linux_raid_member", "LVM2_member", "bcache"];
+/// Types whose contents only become mountable through a device stacked on top — or, for a
+/// locked APFS volume, once it's unlocked in place.
+const CONTAINERS: &[&str] =
+    &[LUKS, GELI, APFS_LOCKED, "BitLocker", "linux_raid_member", "LVM2_member", "bcache"];
 
-/// A LUKS container's type: the one kind devmounts opens itself (with udisks2), and locks again.
+/// A LUKS container's type (Linux): opened and closed with udisks2.
 pub const LUKS: &str = "crypto_LUKS";
+
+/// A GELI provider's type (FreeBSD): attached with `geli attach` and detached with `geli detach`.
+/// GEOM shows one only while it's attached; a config declares one (`geli = true`) for the time it
+/// isn't.
+pub const GELI: &str = "geli";
+
+/// A locked APFS volume's type (macOS): unlocked in place with `diskutil`, after which it's
+/// `apfs`; macOS locks it again itself when it's unmounted.
+pub const APFS_LOCKED: &str = "apfs_locked";
+
+/// The containers devmounts opens itself, when the device in them may be mounted — and closes
+/// again after `remove --unmount` (but a locked APFS volume, which macOS closes).
+pub const UNLOCKABLE: &[&str] = &[LUKS, GELI, APFS_LOCKED];
 
 /// Recognized but not mountable as a filesystem.
 const NOT_FILESYSTEMS: &[&str] = &["swap", "zfs_member", "ceph", "drbd", "VMFS_volume_member"];
@@ -55,7 +71,7 @@ pub fn find_device(id: &DeviceId, devices: &[BlockDevice]) -> Result<ResolvedDev
     let mut candidates: Vec<&BlockDevice> = devices.iter().filter(|d| id_matches(id, d)).collect();
 
     if candidates.is_empty() {
-        return Err(Error::DeviceNotFound { id: id.to_string(), hint: near_misses(id, devices) });
+        return Err(not_found(id, devices, Platform::CURRENT));
     }
 
     // A device stacked on another candidate (multipath, dm-linear over a partition, …) shows
@@ -172,10 +188,21 @@ fn container_hint(fstype: &str, devnode: &Path) -> String {
         LUKS | "BitLocker" => {
             format!("unlock it first, e.g. `udisksctl unlock -b {}`", devnode.display())
         }
+        GELI => format!("attach it first, e.g. `geli attach {}`", devnode.display()),
+        APFS_LOCKED => {
+            format!("unlock it first, e.g. `diskutil apfs unlockVolume {}`", devnode.display())
+        }
         "linux_raid_member" => "assemble the RAID array first (`mdadm --assemble`)".into(),
         "LVM2_member" => "activate the volume group first (`vgchange -ay`)".into(),
         _ => "activate it first".into(),
     }
+}
+
+/// The error for an `id` no device matches. A near miss explains the most; failing one, what
+/// `platform` can't show of such a device ([`Platform::identifier_hint`]).
+fn not_found(id: &DeviceId, devices: &[BlockDevice], platform: Platform) -> Error {
+    let hint = near_misses(id, devices).or_else(|| platform.identifier_hint(id).map(str::to_owned));
+    Error::DeviceNotFound { id: id.to_string(), hint }
 }
 
 /// Mentions identifiers that only differ in case, which is a common reason for a miss.
@@ -450,10 +477,28 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-        assert!(matches!(
-            find_device(&label("other"), &devices),
-            Err(Error::DeviceNotFound { hint: None, .. })
-        ));
+        // Without a near miss, only what the system can't show is said (on Linux: nothing).
+        match find_device(&label("other"), &devices) {
+            Err(Error::DeviceNotFound { hint, .. }) => {
+                assert_eq!(hint.as_deref(), Platform::CURRENT.identifier_hint(&label("other")))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A miss on a system that can't show what the id names says so — unless a near miss
+    /// explains it better.
+    #[test]
+    fn a_miss_says_what_the_system_cannot_show() {
+        let devices = vec![fs(dev("da0s1", 0, 94), "msdosfs", "", Some("BACKUP"))];
+        let hint = |id: &DeviceId| match not_found(id, &devices, Platform::FreeBsd) {
+            Error::DeviceNotFound { hint, .. } => hint.unwrap_or_default(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(hint(&DeviceId::Uuid("1234-ABCD".into())).contains("only for UFS"));
+        assert!(hint(&label("other")).contains("mounted under another name"));
+        assert!(hint(&label("backup")).contains("\"BACKUP\""), "the near miss");
+        assert_eq!(hint(&DeviceId::PartUuid("p".into())), "", "partuuids are always shown");
     }
 
     #[test]
