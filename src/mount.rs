@@ -1,12 +1,13 @@
-//! Mounting and unmounting on Linux, through udisks2 (`udisksctl`) or plain `mount`.
+//! Mounting and unmounting: the `mount` way every system has — `mount` into
+//! `<mount_base>/<uuid>`, through the run's privileged helper, and `umount` — and Linux's own,
+//! through udisks2 (`udisksctl`). macOS's `diskutil` is in [`crate::macos`].
 //!
 //! udisks2 mounts as the calling user, at the place the desktop would use
 //! (`/run/media/$USER/…` or `/media/$USER/…`) and without a password for removable drives.
 //! A drive udisks2 wants an administrator's password for (an internal one), a machine without
-//! udisks2, or a run as root (where udisks2 would use `/run/media/root`) is mounted at
-//! `<mount_base>/<uuid>` with `mount` instead, through the run's privileged helper. Unmounting is
-//! decided the same way: what `mount` put up comes down with `umount`, an automounter's mount
-//! through udisks2 where it can.
+//! udisks2, or a run as root (where udisks2 would use `/run/media/root`) is mounted the `mount`
+//! way instead. Unmounting is decided the same way: what `mount` put up comes down with
+//! `umount`, an automounter's mount through udisks2 where it can.
 
 use std::ffi::OsString;
 use std::fs;
@@ -16,12 +17,15 @@ use std::path::{Path, PathBuf};
 use crate::config::{MountMethod, is_plain_absolute};
 use crate::error::{Error, Result};
 use crate::escalate;
+use crate::platform::Platform;
 use crate::privileged::{Op, Privileges};
 use crate::system::{BlockDevice, ContainerRequest, MountRequest, UnmountRequest};
 
-/// Directories udisks2 and similar automounters mount into ([`LinuxSystem`](crate::LinuxSystem)'s
-/// default `automount_dirs`).
-pub const AUTOMOUNT_DIRS: &[&str] = &["/run/media", "/media"];
+/// What a system without udisks2 says to an unlock or a lock — neither of which comes to pass
+/// there, as only Linux's inventory tells a LUKS container from any other partition.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(crate) const LUKS_NEEDS_UDISKS: &str =
+    "devmounts opens and closes LUKS containers with udisks2, which only Linux has";
 
 /// What actually mounts or unmounts, once `auto` is decided: udisks2, or `mount` / `umount`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,31 +107,45 @@ pub fn mount(request: &MountRequest<'_>) -> Result<()> {
     }
 }
 
-/// The `mount` method: at `<mount_base>/<uuid>`, made for it, and removed again if mounting fails.
-fn mount_into_base(request: &MountRequest<'_>) -> Result<()> {
+/// The `mount` way: at `<mount_base>/<uuid>`, made for it, and removed again if mounting fails.
+/// The filesystem type is named where the system's `mount` doesn't find it out itself.
+pub(crate) fn mount_into_base(request: &MountRequest<'_>) -> Result<()> {
     let device = request.device;
     let dir = mount_dir(&request.mount_base, device);
     create_dir(&dir, request.privileges)?;
+    let fstype = device.fstype.clone().filter(|_| Platform::CURRENT.mount_needs_type());
     let options = mount_options(device, &request.options, request.top_level);
-    mount_as_root(&device.devnode, &dir, options, request.privileges).inspect_err(|_| {
+    mount_as_root(&device.devnode, &dir, fstype, options, request.privileges).inspect_err(|_| {
         // Don't leave an empty mount point behind.
         let _ = remove_dir(&dir, request.privileges);
     })
 }
 
+/// Whether the mount to come down is devmounts' own, at the `<mount_base>/<uuid>` the `mount`
+/// way makes for the device.
+pub(crate) fn is_own_mount(request: &UnmountRequest<'_>) -> bool {
+    request.mount.mount_point == mount_dir(&request.mount_base, request.device)
+}
+
+/// The `umount` way, through the run's privileged helper; devmounts' own mount point goes with
+/// the mount, as it was made for it.
+pub(crate) fn unmount_with_umount(request: &UnmountRequest<'_>) -> Result<()> {
+    let mount_point = &request.mount.mount_point;
+    umount_as_root(mount_point, request.privileges).map_err(|err| Error::UnmountFailed {
+        mount_point: mount_point.clone(),
+        message: inner_message(err),
+    })?;
+    if is_own_mount(request) {
+        let _ = remove_dir(mount_point, request.privileges);
+    }
+    Ok(())
+}
+
 pub fn unmount(request: &UnmountRequest<'_>) -> Result<()> {
     let mount_point = &request.mount.mount_point;
     let fail = |message: String| Error::UnmountFailed { mount_point: mount_point.clone(), message };
-    let own_mount = *mount_point == mount_dir(&request.mount_base, request.device);
-    match choose_unmount(request.method, own_mount) {
-        Via::Mount => {
-            umount_as_root(mount_point, request.privileges)
-                .map_err(|err| fail(inner_message(err)))?;
-            if own_mount {
-                let _ = remove_dir(mount_point, request.privileges); // made for the mount
-            }
-            Ok(())
-        }
+    match choose_unmount(request.method, is_own_mount(request)) {
+        Via::Mount => unmount_with_umount(request),
         Via::Udisks => {
             if let Some(why) = udisksctl_missing() {
                 return Err(fail(why));
@@ -227,9 +245,18 @@ fn no_interaction(polkit: Polkit) -> Option<OsString> {
     }
 }
 
-/// `mount [-o <options>] -- <device> <dir>`.
-pub fn mount_argv(device: &Path, dir: &Path, options: &[String]) -> Vec<OsString> {
+/// `mount [-t <fstype>] [-o <options>] -- <device> <dir>`.
+pub fn mount_argv(
+    device: &Path,
+    dir: &Path,
+    fstype: Option<&str>,
+    options: &[String],
+) -> Vec<OsString> {
     let mut argv = vec![OsString::from("mount")];
+    if let Some(fstype) = fstype {
+        argv.push("-t".into());
+        argv.push(fstype.into());
+    }
     if !options.is_empty() {
         argv.push("-o".into());
         argv.push(options.join(",").into());
@@ -322,15 +349,13 @@ fn remove_dir(dir: &Path, privileges: &Privileges) -> Result<()> {
 fn mount_as_root(
     device: &Path,
     dir: &Path,
+    fstype: Option<String>,
     options: Vec<String>,
     privileges: &Privileges,
 ) -> Result<()> {
-    let argv = mount_argv(device, dir, &options);
-    as_root(
-        &argv,
-        Op::Mount { options, device: device.to_owned(), dir: dir.to_owned() },
-        privileges,
-    )
+    let argv = mount_argv(device, dir, fstype.as_deref(), &options);
+    let op = Op::Mount { fstype, options, device: device.to_owned(), dir: dir.to_owned() };
+    as_root(&argv, op, privileges)
 }
 
 fn umount_as_root(mount_point: &Path, privileges: &Privileges) -> Result<()> {
@@ -360,7 +385,7 @@ fn os_args<const N: usize>(args: [&str; N]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
 }
 
-fn inner_message(err: Error) -> String {
+pub(crate) fn inner_message(err: Error) -> String {
     match err {
         Error::CommandFailed { command, message } => format!("{message} (from `{command}`)"),
         other => other.to_string(),
@@ -438,12 +463,16 @@ mod tests {
             ["udisksctl", "lock", "--block-device", "/dev/sdb1"]
         );
         assert_eq!(
-            words(mount_argv(dev, Path::new("/run/devmounts/u"), &opts)),
+            words(mount_argv(dev, Path::new("/run/devmounts/u"), None, &opts)),
             ["mount", "-o", "ro,noatime", "--", "/dev/sdb1", "/run/devmounts/u"]
         );
         assert_eq!(
-            words(mount_argv(dev, Path::new("/m"), &[])),
+            words(mount_argv(dev, Path::new("/m"), None, &[])),
             ["mount", "--", "/dev/sdb1", "/m"]
+        );
+        assert_eq!(
+            words(mount_argv(Path::new("/dev/msdosfs/X"), Path::new("/m"), Some("msdosfs"), &opts)),
+            ["mount", "-t", "msdosfs", "-o", "ro,noatime", "--", "/dev/msdosfs/X", "/m"]
         );
         assert_eq!(words(umount_argv(Path::new("/-odd dir"))), ["umount", "--", "/-odd dir"]);
     }
@@ -457,6 +486,7 @@ mod tests {
             shown(mount_argv(
                 Path::new("/dev/sdb1"),
                 Path::new("/run/devmounts/a b"),
+                None,
                 &["ro".into()]
             )),
             "mount -o ro -- /dev/sdb1 '/run/devmounts/a b'"
@@ -538,7 +568,7 @@ mod tests {
     }
 
     fn automount_dirs() -> Vec<PathBuf> {
-        AUTOMOUNT_DIRS.iter().map(PathBuf::from).collect()
+        Platform::Linux.automount_dirs().iter().map(PathBuf::from).collect()
     }
 
     #[test]

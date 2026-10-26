@@ -1,15 +1,15 @@
 //! Inspecting, creating and removing the links.
 //!
 //! A link is only ever changed in place of a symlink, and atomically: the new link is swapped in
-//! with `renameat2(RENAME_EXCHANGE)`, and what it replaced is checked — a directory or file that
-//! appeared since [`inspect`] looked is swapped straight back, untouched. A link is taken down the
-//! same way: moved aside, checked, deleted. Changes are made directly when possible, and through
-//! the run's privileged helper ([`crate::privileged`]) only after a permission error.
+//! (`renameat2(RENAME_EXCHANGE)` on Linux, `renamex_np(RENAME_SWAP)` on macOS), and what it
+//! replaced is checked — a directory or file that appeared since [`inspect`] looked is swapped
+//! straight back, untouched. A link is taken down the same way: moved aside, checked, deleted.
+//! Where the system or the filesystem can't swap (FreeBSD, some filesystems), the check is made
+//! right before a plain rename instead. Changes are made directly when possible, and through the
+//! run's privileged helper ([`crate::privileged`]) only after a permission error.
 
-use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -139,7 +139,7 @@ pub(crate) fn put_symlink(link: &Path, target: &Path) -> io::Result<Placed> {
     std::os::unix::fs::symlink(target, &temp)?;
     // A second round only when something appeared at `link` in between.
     for _ in 0..2 {
-        match renameat2(&temp, link, libc::RENAME_EXCHANGE) {
+        match rename(&temp, link, Rename::Exchange) {
             Ok(()) => {
                 // `temp` now holds what was at `link`.
                 let old = fs::symlink_metadata(&temp)?;
@@ -147,14 +147,17 @@ pub(crate) fn put_symlink(link: &Path, target: &Path) -> io::Result<Placed> {
                     fs::remove_file(&temp)?;
                     return Ok(Placed::Done);
                 }
-                renameat2(&temp, link, libc::RENAME_EXCHANGE)?;
+                rename(&temp, link, Rename::Exchange)?;
                 fs::remove_file(&temp)?;
                 return Ok(Placed::Blocked { kind: kind_name(&old).into() });
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                match renameat2(&temp, link, libc::RENAME_NOREPLACE) {
+                match rename(&temp, link, Rename::NoReplace) {
                     Ok(()) => return Ok(Placed::Done),
                     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    // Whether a filesystem can exchange is only found out once there's something
+                    // to exchange with.
+                    Err(err) if unsupported(&err) => return replace_checked(&temp, link),
                     Err(err) => return Err(discard(&temp, err)),
                 }
             }
@@ -168,7 +171,7 @@ pub(crate) fn put_symlink(link: &Path, target: &Path) -> io::Result<Placed> {
     ))
 }
 
-/// Where the filesystem can't exchange two names: the same check, right before a plain rename —
+/// Where the system or filesystem can't exchange two names: the same check, right before a plain rename —
 /// a far narrower window than between [`inspect`] and the change, if not none.
 fn replace_checked(temp: &Path, link: &Path) -> io::Result<Placed> {
     match fs::symlink_metadata(link) {
@@ -186,14 +189,14 @@ fn replace_checked(temp: &Path, link: &Path) -> io::Result<Placed> {
 pub(crate) fn take_symlink(link: &Path) -> io::Result<Placed> {
     let temp = aside(link)?;
     let _ = fs::remove_file(&temp);
-    match renameat2(link, &temp, libc::RENAME_NOREPLACE) {
+    match rename(link, &temp, Rename::NoReplace) {
         Ok(()) => {
             let taken = fs::symlink_metadata(&temp)?;
             if taken.file_type().is_symlink() {
                 fs::remove_file(&temp)?;
                 return Ok(Placed::Done);
             }
-            renameat2(&temp, link, libc::RENAME_NOREPLACE)?;
+            rename(&temp, link, Rename::NoReplace)?;
             Ok(Placed::Blocked { kind: kind_name(&taken).into() })
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Placed::Done),
@@ -202,7 +205,8 @@ pub(crate) fn take_symlink(link: &Path) -> io::Result<Placed> {
     }
 }
 
-/// [`take_symlink`] where the filesystem can't rename without replacing: check, then delete.
+/// [`take_symlink`] where the system or filesystem can't rename without replacing: check, then
+/// delete.
 fn remove_checked(link: &Path) -> io::Result<Placed> {
     match fs::symlink_metadata(link) {
         Ok(meta) if !meta.file_type().is_symlink() => {
@@ -235,15 +239,30 @@ fn discard(temp: &Path, err: io::Error) -> io::Error {
     err
 }
 
-/// The filesystem (or kernel) can't do what was asked of `renameat2`.
+/// The system or filesystem can't do what was asked of [`rename`]. (`ENOTSUP` is macOS's word
+/// for it, where it isn't `EOPNOTSUPP`, as on Linux.)
 fn unsupported(err: &io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP))
+    let codes = [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP, libc::ENOTSUP];
+    err.raw_os_error().is_some_and(|code| codes.contains(&code))
 }
 
-fn renameat2(from: &Path, to: &Path, flags: libc::c_uint) -> io::Result<()> {
-    let nul = |_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte");
-    let from = CString::new(from.as_os_str().as_bytes()).map_err(nul)?;
-    let to = CString::new(to.as_os_str().as_bytes()).map_err(nul)?;
+/// A rename that a plain one can't do.
+#[derive(Debug, Clone, Copy)]
+enum Rename {
+    /// Swaps the two names, both of which must exist.
+    Exchange,
+    /// Fails (`EEXIST`) where the new name is taken, rather than replace what's there.
+    NoReplace,
+}
+
+/// `renameat2(RENAME_EXCHANGE)` / `renameat2(RENAME_NOREPLACE)`.
+#[cfg(target_os = "linux")]
+fn rename(from: &Path, to: &Path, how: Rename) -> io::Result<()> {
+    let flags = match how {
+        Rename::Exchange => libc::RENAME_EXCHANGE,
+        Rename::NoReplace => libc::RENAME_NOREPLACE,
+    };
+    let (from, to) = (c_path(from)?, c_path(to)?);
     // SAFETY: both pointers are to NUL-terminated strings that outlive the call, and
     // renameat2 reads nothing else.
     let rc = unsafe {
@@ -257,6 +276,34 @@ fn renameat2(from: &Path, to: &Path, flags: libc::c_uint) -> io::Result<()> {
         )
     };
     if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+/// `renamex_np(RENAME_SWAP)` / `renamex_np(RENAME_EXCL)`.
+#[cfg(target_os = "macos")]
+fn rename(from: &Path, to: &Path, how: Rename) -> io::Result<()> {
+    let flags = match how {
+        Rename::Exchange => libc::RENAME_SWAP,
+        Rename::NoReplace => libc::RENAME_EXCL,
+    };
+    let (from, to) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both pointers are to NUL-terminated strings that outlive the call, and
+    // renamex_np reads nothing else.
+    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), flags) };
+    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+/// Neither, so that the checked fallbacks run: FreeBSD's `renameat2` came with 15.1, and could
+/// only exchange two names from 15.2 on; a program bound to it wouldn't start on a release before.
+#[cfg(target_os = "freebsd")]
+fn rename(_: &Path, _: &Path, _: Rename) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::ENOSYS))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
 
 #[cfg(test)]
@@ -325,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn without_renameat2_the_same_checks_hold() {
+    fn without_atomic_renames_the_same_checks_hold() {
         let tmp = tempfile::tempdir().unwrap();
         let link = tmp.path().join("x");
         let temp = aside(&link).unwrap();

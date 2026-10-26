@@ -56,6 +56,7 @@ pub enum Op {
     },
     /// Mount `device` at `dir` ([`mount::mount_argv`]).
     Mount {
+        fstype: Option<String>,
         options: Vec<String>,
         #[serde(with = "bytes")]
         device: PathBuf,
@@ -92,8 +93,8 @@ impl Op {
             Op::RemoveLink { link } => link::take_symlink(link).map(Reply::from),
             Op::CreateDir { dir } => fs::create_dir_all(dir).map(|()| Reply::Done),
             Op::RemoveDir { dir } => fs::remove_dir(dir).map(|()| Reply::Done),
-            Op::Mount { options, device, dir } => {
-                return run(&mount::mount_argv(device, dir, options));
+            Op::Mount { fstype, options, device, dir } => {
+                return run(&mount::mount_argv(device, dir, fstype.as_deref(), options));
             }
             Op::Unmount { mount_point } => return run(&mount::umount_argv(mount_point)),
         };
@@ -300,7 +301,12 @@ mod tests {
             Op::RemoveLink { link: odd.clone() },
             Op::CreateDir { dir: "/run/devmounts/u".into() },
             Op::RemoveDir { dir: "/run/devmounts/u".into() },
-            Op::Mount { options: vec!["ro".into()], device: "/dev/sdb1".into(), dir: odd.clone() },
+            Op::Mount {
+                fstype: Some("msdosfs".into()),
+                options: vec!["ro".into()],
+                device: "/dev/sdb1".into(),
+                dir: odd.clone(),
+            },
             Op::Unmount { mount_point: odd },
         ];
         for op in ops {

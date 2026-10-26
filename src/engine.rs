@@ -18,6 +18,7 @@ use crate::escalate::Escalation;
 use crate::link::{self, LinkState};
 use crate::mount;
 use crate::mountinfo::MountEntry;
+use crate::platform::Platform;
 use crate::privileged::Privileges;
 use crate::report::{
     Command, DeviceReport, LinkOutcome, LinkReport, MountChange, MountSummary, Report,
@@ -95,13 +96,7 @@ fn run(
     options: &Options,
     system: &dyn System,
 ) -> Result<Report> {
-    if let Some(root) = &options.root
-        && !is_plain_absolute(root)
-    {
-        let problem =
-            format!("the link root must be an absolute path without '..' (got {})", root.display());
-        return Err(Error::ConfigInvalid { problems: vec![problem] });
-    }
+    let root = link_root(config, options, Platform::CURRENT)?;
     let ctx = Context {
         command,
         config,
@@ -109,7 +104,7 @@ fn run(
         system,
         devices: RefCell::new(system.block_devices()?),
         automount_dirs: system.automount_dirs(),
-        root: options.root.clone().unwrap_or_else(|| config.settings.root.clone()),
+        root,
         privileges: Privileges::new(
             options.escalation.clone().unwrap_or_else(|| config.settings.escalation.clone()),
             options.helper.clone(),
@@ -130,6 +125,25 @@ fn run(
         })
         .collect();
     Ok(Report { command, dry_run: options.dry_run, root: ctx.root, devices })
+}
+
+/// Where the links go: [`Options::root`] (`--root`) over `settings.root` — refused when it isn't
+/// a plain absolute path, or can't hold links on `platform` (`/` on macOS).
+pub fn link_root(config: &Config, options: &Options, platform: Platform) -> Result<PathBuf> {
+    let refused = |problem: String| Err(Error::ConfigInvalid { problems: vec![problem] });
+    if let Some(root) = &options.root
+        && !is_plain_absolute(root)
+    {
+        return refused(format!(
+            "the link root must be an absolute path without '..' (got {})",
+            root.display()
+        ));
+    }
+    let root = options.root.clone().unwrap_or_else(|| config.settings.root.clone());
+    match platform.root_refusal(&root) {
+        Some(why) => refused(format!("the link root can't be {}: {why}", root.display())),
+        None => Ok(root),
+    }
 }
 
 struct Context<'a> {

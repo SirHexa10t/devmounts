@@ -1,4 +1,7 @@
-//! The `devmounts` binary, run against fixture sysfs/udev/mountinfo trees.
+//! The `devmounts` binary, run against fixture sysfs/udev/mountinfo trees — on Linux only:
+//! elsewhere the binary reads the machine its own way, which no fixture stands in for.
+
+#![cfg(target_os = "linux")]
 
 mod common;
 

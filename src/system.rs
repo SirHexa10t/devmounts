@@ -1,7 +1,9 @@
 //! Access to the machine: block devices, the mount table, and mounting.
 //!
 //! Everything machine-specific goes through the [`System`] trait, so the logic in
-//! [`crate::resolve`] and [`crate::engine`] can be tested against fake machines.
+//! [`crate::resolve`] and [`crate::engine`] can be tested against fake machines. Each system
+//! devmounts runs on has its own: [`LinuxSystem`] here, and macOS's and FreeBSD's in their
+//! modules; [`NativeSystem`] is the one this program was built for.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -16,6 +18,7 @@ use crate::config::MountMethod;
 use crate::error::{Error, Result};
 use crate::escalate;
 use crate::mountinfo::{self, DevNum, MountEntry};
+use crate::platform::Platform;
 use crate::privileged::Privileges;
 use crate::udev::{self, Identity};
 
@@ -121,14 +124,24 @@ pub trait System {
     fn lock(&self, request: &ContainerRequest<'_>) -> Result<()>;
 }
 
-/// The real machine. Paths can be redirected for tests or unusual setups.
+/// The machine this program was built for.
+#[cfg(target_os = "linux")]
+pub type NativeSystem = LinuxSystem;
+/// The machine this program was built for.
+#[cfg(target_os = "macos")]
+pub type NativeSystem = crate::macos::MacOsSystem;
+/// The machine this program was built for.
+#[cfg(target_os = "freebsd")]
+pub type NativeSystem = crate::freebsd::FreeBsdSystem;
+
+/// The real machine, on Linux. Paths can be redirected for tests or unusual setups.
 #[derive(Debug, Clone)]
 pub struct LinuxSystem {
     pub sysfs: PathBuf,
     pub udev_data: PathBuf,
     pub mountinfo: PathBuf,
     pub dev: PathBuf,
-    /// Where an automounter mounts devices ([`AUTOMOUNT_DIRS`](crate::mount::AUTOMOUNT_DIRS)).
+    /// Where an automounter mounts devices ([`Platform::automount_dirs`]).
     pub automount_dirs: Vec<PathBuf>,
 }
 
@@ -139,7 +152,7 @@ impl Default for LinuxSystem {
             udev_data: "/run/udev/data".into(),
             mountinfo: "/proc/self/mountinfo".into(),
             dev: "/dev".into(),
-            automount_dirs: crate::mount::AUTOMOUNT_DIRS.iter().map(PathBuf::from).collect(),
+            automount_dirs: Platform::Linux.automount_dirs().iter().map(PathBuf::from).collect(),
         }
     }
 }
@@ -162,9 +175,7 @@ impl LinuxSystem {
             udev_data: var("DEVMOUNTS_UDEV_DATA", d.udev_data),
             mountinfo: var("DEVMOUNTS_MOUNTINFO", d.mountinfo),
             dev: var("DEVMOUNTS_DEV", d.dev),
-            automount_dirs: std::env::var_os("DEVMOUNTS_AUTOMOUNT_DIRS")
-                .map(|dirs| std::env::split_paths(&dirs).collect())
-                .unwrap_or(d.automount_dirs),
+            automount_dirs: automount_dirs_from_env(d.automount_dirs),
         }
     }
 
@@ -249,8 +260,7 @@ impl System for LinuxSystem {
     }
 
     fn device_number(&self, path: &Path) -> Option<DevNum> {
-        let meta = fs::metadata(path).ok()?;
-        meta.file_type().is_block_device().then(|| DevNum::from_dev_t(meta.rdev()))
+        node_number(path, FileTypeExt::is_block_device)
     }
 
     fn automount_dirs(&self) -> Vec<PathBuf> {
@@ -272,6 +282,21 @@ impl System for LinuxSystem {
     fn lock(&self, request: &ContainerRequest<'_>) -> Result<()> {
         crate::mount::lock(request)
     }
+}
+
+/// The automounters' directories from `DEVMOUNTS_AUTOMOUNT_DIRS` (`:`-separated, like `PATH`),
+/// when it's set — for every system's `from_env`.
+pub(crate) fn automount_dirs_from_env(default: Vec<PathBuf>) -> Vec<PathBuf> {
+    std::env::var_os("DEVMOUNTS_AUTOMOUNT_DIRS")
+        .map(|dirs| std::env::split_paths(&dirs).collect())
+        .unwrap_or(default)
+}
+
+/// The device number of the node `path`, when `is_node` takes it for a device's: a block device
+/// on Linux and macOS, a character device on FreeBSD, which has no others.
+pub(crate) fn node_number(path: &Path, is_node: impl Fn(&fs::FileType) -> bool) -> Option<DevNum> {
+    let meta = fs::metadata(path).ok()?;
+    is_node(&meta.file_type()).then(|| DevNum::from_dev_t(meta.rdev()))
 }
 
 fn lsblk_identities() -> Option<HashMap<String, Identity>> {

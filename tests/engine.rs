@@ -7,8 +7,10 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use common::{FakeSystem, device, mkdir, tmpdir};
+use devmounts::engine::link_root;
 use devmounts::{
-    Colors, Config, Error, Escalation, LinkOutcome, LinkReport, MountChange, Options, Report,
+    Colors, Config, Error, Escalation, LinkOutcome, LinkReport, MountChange, Options, Platform,
+    Report,
 };
 use tempfile::TempDir;
 
@@ -908,6 +910,8 @@ fn one_failing_device_does_not_stop_the_others() {
     assert!(report.devices[1].ok());
 }
 
+/// (Not on macOS, where `/` is refused as the link root altogether.)
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn reserved_names_are_checked_against_the_runtime_root() {
     let s = Setup::new();
@@ -941,6 +945,34 @@ fn root_overrides_must_be_absolute_and_free_of_dotdot() {
             devmounts::apply(&config, &Options { root: Some(bad.into()), ..opts() }, &s.sys);
         assert!(matches!(result, Err(Error::ConfigInvalid { .. })), "{bad}");
     }
+}
+
+/// Where `/` can't hold links (macOS), it can't be the link root, given or configured — a config
+/// made by a program rather than read has its default — and the run says why, and how names can
+/// go in `/` all the same.
+#[test]
+fn a_root_the_system_refuses_stops_the_run() {
+    let s = Setup::new();
+    let config = s.config(&s.device("label = 'DATA'", "data", ""));
+    let slash = Options { root: Some("/".into()), ..opts() };
+    let made =
+        Config { settings: devmounts::Settings::defaults_for(Platform::MacOs), ..config.clone() };
+    for (config, options) in [(&config, &slash), (&made, &opts())] {
+        match link_root(config, options, Platform::MacOs) {
+            Err(Error::ConfigInvalid { problems }) => {
+                assert_eq!(problems.len(), 1, "{problems:?}");
+                assert!(
+                    problems[0].starts_with("the link root can't be /: on macOS"),
+                    "{problems:?}"
+                );
+                assert!(problems[0].contains("/etc/synthetic.conf"), "{problems:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(link_root(&config, &opts(), Platform::MacOs).unwrap(), s.root, "a root of its own");
+    assert_eq!(link_root(&config, &slash, Platform::Linux).unwrap(), Path::new("/"));
+    assert_eq!(link_root(&config, &slash, Platform::FreeBsd).unwrap(), Path::new("/"));
 }
 
 #[test]

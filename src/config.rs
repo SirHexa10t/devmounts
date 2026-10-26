@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::escalate::Escalation;
+use crate::platform::Platform;
 
 /// Names refused as link names when links are created directly in `/`: the system's directories,
 /// and the links some systems keep there themselves (Debian's `vmlinuz` and `initrd.img`).
@@ -86,14 +87,23 @@ pub struct Settings {
     pub escalation: Escalation,
 }
 
+/// The defaults on the system this program was built for ([`Settings::defaults_for`]).
 impl Default for Settings {
     fn default() -> Self {
+        Settings::defaults_for(Platform::CURRENT)
+    }
+}
+
+impl Settings {
+    /// What a config that says nothing gets on `platform`. Its root is `/` everywhere — on macOS
+    /// too, where a run refuses it ([`Platform::root_refusal`]), so a config there names its own.
+    pub fn defaults_for(platform: Platform) -> Settings {
         Settings {
             root: PathBuf::from("/"),
             automount: true,
             mount_options: Vec::new(),
             mount_method: MountMethod::Auto,
-            mount_base: PathBuf::from("/run/devmounts"),
+            mount_base: platform.default_mount_base(),
             escalation: Escalation::Auto,
         }
     }
@@ -286,9 +296,16 @@ impl FromStr for Config {
     type Err = Error;
 
     fn from_str(text: &str) -> Result<Config> {
+        Config::parse_for(text, Platform::CURRENT)
+    }
+}
+
+impl Config {
+    /// The config `text` describes, checked for `platform`.
+    pub fn parse_for(text: &str, platform: Platform) -> Result<Config> {
         let raw: RawConfig =
             toml::from_str(text).map_err(|err| Error::ConfigParse { message: err.to_string() })?;
-        raw.validate()
+        raw.validate(platform)
     }
 }
 
@@ -334,10 +351,12 @@ struct RawDevice {
 }
 
 impl RawConfig {
-    fn validate(self) -> Result<Config> {
+    fn validate(self, platform: Platform) -> Result<Config> {
         let mut problems = Vec::new();
-        let settings = self.settings.validate(&mut problems);
-        let in_slash = settings.root == Path::new("/");
+        let settings = self.settings.validate(&mut problems, platform);
+        // Where `/` is refused (macOS), links never go there, so its names aren't reserved either.
+        let in_slash =
+            settings.root == Path::new("/") && platform.root_refusal(&settings.root).is_none();
 
         if self.device.is_empty() {
             problems.push("no [[device]] entries".into());
@@ -371,14 +390,21 @@ impl RawConfig {
 }
 
 impl RawSettings {
-    fn validate(self, problems: &mut Vec<String>) -> Settings {
-        let defaults = Settings::default();
+    fn validate(self, problems: &mut Vec<String>, platform: Platform) -> Settings {
+        let defaults = Settings::defaults_for(platform);
+        let named_root = self.root.is_some();
         let root = self.root.unwrap_or(defaults.root);
         if !is_plain_absolute(&root) {
             problems.push(format!(
                 "settings.root must be an absolute path without '..' (got {})",
                 root.display()
             ));
+        } else if let Some(why) = platform.root_refusal(&root) {
+            problems.push(if named_root {
+                format!("settings.root can't be {}: {why}", root.display())
+            } else {
+                format!("settings.root must be set: {why}")
+            });
         }
         let mount_base = self.mount_base.unwrap_or(defaults.mount_base);
         if !is_plain_absolute(&mount_base) {
@@ -388,6 +414,14 @@ impl RawSettings {
             ));
         } else if mount_base == Path::new("/") {
             problems.push("settings.mount_base can't be / — what's right below it counts as devmounts' mount points".into());
+        }
+        let mount_method = self.mount_method.unwrap_or_default();
+        if mount_method == MountMethod::Udisks && !platform.has_udisks() {
+            problems.push(
+                "settings.mount_method = \"udisks\" needs udisks2, which only Linux has (`auto` \
+                 mounts the system's own way)"
+                    .into(),
+            );
         }
         let mount_options = self.mount_options.unwrap_or_default();
         check_mount_options("settings.mount_options", &mount_options, problems);
@@ -404,7 +438,7 @@ impl RawSettings {
             root,
             automount: self.automount.unwrap_or(defaults.automount),
             mount_options,
-            mount_method: self.mount_method.unwrap_or_default(),
+            mount_method,
             mount_base,
             escalation,
         }
@@ -505,12 +539,17 @@ fn check_mount_options(at: &str, options: &[String], problems: &mut Vec<String>)
 mod tests {
     use super::*;
 
+    /// Read as on Linux, whatever this is built for; [`problems_on`] reads as on another system.
     fn parse(text: &str) -> Result<Config> {
-        text.parse()
+        Config::parse_for(text, Platform::Linux)
     }
 
     fn problems(text: &str) -> Vec<String> {
-        match parse(text) {
+        problems_on(Platform::Linux, text)
+    }
+
+    fn problems_on(platform: Platform, text: &str) -> Vec<String> {
+        match Config::parse_for(text, platform) {
             Err(Error::ConfigInvalid { problems }) => problems,
             other => panic!("expected ConfigInvalid, got {other:?}"),
         }
@@ -532,13 +571,61 @@ mod tests {
     #[test]
     fn minimal_config_gets_defaults() {
         let config = parse("[[device]]\nlabel = 'X'\ndevmount = 'x'").unwrap();
-        assert_eq!(config.settings, Settings::default());
+        assert_eq!(config.settings, Settings::defaults_for(Platform::Linux));
         let device = &config.devices[0];
         assert_eq!(device.id, DeviceId::Label("X".into()));
         assert_eq!(device.devmount, "x");
         assert!(device.mounts.is_empty(), "a device may have only its devmount");
         assert!(device.automount(&config.settings));
         assert!(device.mount_options(&config.settings).is_empty());
+    }
+
+    /// Linux and FreeBSD link into `/` by default, and each mounts beside its run-time state.
+    #[test]
+    fn each_system_has_defaults_of_its_own() {
+        let bases =
+            [(Platform::Linux, "/run/devmounts"), (Platform::FreeBsd, "/var/run/devmounts")];
+        for (platform, mount_base) in bases {
+            let config =
+                Config::parse_for("[[device]]\nlabel = 'X'\ndevmount = 'x'", platform).unwrap();
+            assert_eq!(config.settings, Settings::defaults_for(platform), "{platform:?}");
+            assert_eq!(config.settings.root, Path::new("/"), "{platform:?}");
+            assert_eq!(config.settings.mount_base, Path::new(mount_base), "{platform:?}");
+        }
+    }
+
+    /// On macOS, where `/` is read-only, a config names its own root — and is told how names can
+    /// go in `/` all the same. Names `/` reserves aren't refused there, as links never go in it.
+    #[test]
+    fn on_macos_a_config_names_its_own_root() {
+        let device = "[[device]]\nlabel = 'X'\ndevmount = 'usr'\n";
+        let missing = problems_on(Platform::MacOs, device);
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(
+            missing[0].starts_with("settings.root must be set: on macOS `/` is read-only")
+                && missing[0].contains("/etc/synthetic.conf"),
+            "{missing:?}"
+        );
+        let slash = problems_on(Platform::MacOs, &format!("[settings]\nroot = '/'\n{device}"));
+        assert_eq!(slash.len(), 1, "{slash:?}");
+        assert!(slash[0].starts_with("settings.root can't be /: on macOS"), "{slash:?}");
+        let own = format!("[settings]\nroot = '/Users/me/links'\n{device}");
+        let config = Config::parse_for(&own, Platform::MacOs).unwrap();
+        assert_eq!(config.settings.root, Path::new("/Users/me/links"));
+        assert_eq!(config.settings.mount_base, Path::new("/private/var/run/devmounts"));
+    }
+
+    /// `udisks` names Linux's udisks2, so elsewhere it's refused, saying what works instead.
+    #[test]
+    fn udisks_is_only_for_linux() {
+        let text = "[settings]\nroot = '/l'\nmount_method = 'udisks'\n\
+                    [[device]]\nlabel = 'X'\ndevmount = 'x'";
+        assert!(parse(text).is_ok());
+        for platform in [Platform::MacOs, Platform::FreeBsd] {
+            let problems = problems_on(platform, text);
+            assert_eq!(problems.len(), 1, "{platform:?}: {problems:?}");
+            assert!(problems[0].contains("needs udisks2, which only Linux has"), "{problems:?}");
+        }
     }
 
     #[test]
@@ -577,8 +664,8 @@ mod tests {
         let config = parse(include_str!("../example.toml")).unwrap();
         assert_eq!(
             config.settings,
-            Settings::default(),
-            "its settings section spells out the defaults"
+            Settings::defaults_for(Platform::Linux),
+            "its settings section spells out Linux's defaults"
         );
         let ids: Vec<String> = config.devices.iter().map(|d| d.id.to_string()).collect();
         assert_eq!(

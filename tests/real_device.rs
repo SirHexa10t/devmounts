@@ -5,7 +5,10 @@
 //! ```
 //!
 //! If the device isn't mounted, it's mounted read-only (nothing is written to it) and
-//! unmounted again at the end. Its root is linked into a temporary directory.
+//! unmounted again at the end. Its root is linked into a temporary directory. Linux only, as the
+//! machine is read through [`LinuxSystem`](devmounts::LinuxSystem).
+
+#![cfg(target_os = "linux")]
 
 mod common;
 

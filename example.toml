@@ -2,12 +2,13 @@
 #   devmounts status example.toml      # what's there now
 #   devmounts --dry-run example.toml   # what applying it would do
 
-[settings]                       # every setting is optional; these are the defaults
-root = "/"                       # where the links are created
+[settings]                       # every setting is optional; these are Linux's defaults
+root = "/"                       # where the links are created (on macOS: required, and not /)
 automount = true                 # mount a listed device that isn't mounted
 mount_options = []               # options for every mount devmounts makes, e.g. ["noatime"]
-mount_method = "auto"            # auto | udisks | mount
+mount_method = "auto"            # auto | udisks (Linux only) | mount
 mount_base = "/run/devmounts"    # where the `mount` method mounts: <mount_base>/<uuid>
+                                 # (macOS: /private/var/run/devmounts, FreeBSD: /var/run/devmounts)
 escalate = "auto"                # auto | none | a command such as "sudo" or ["doas", "-n"]
 
 # A data drive, by its filesystem UUID: /data -> wherever it's mounted, and short links into it.

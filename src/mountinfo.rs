@@ -24,12 +24,12 @@ impl DevNum {
         DevNum { major, minor }
     }
 
-    /// Splits a `dev_t` the way glibc's `major()`/`minor()` do.
+    /// Splits a `dev_t` (`st_dev`, `st_rdev`) the way this system's `major()`/`minor()` do —
+    /// each system encodes it its own way.
     pub const fn from_dev_t(dev: u64) -> Self {
-        DevNum {
-            major: (((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0x0000_0fff)) as u32,
-            minor: (((dev >> 12) & 0xffff_ff00) | (dev & 0x0000_00ff)) as u32,
-        }
+        // As wide as `MetadataExt` hands it over; macOS's own is narrower, which this undoes.
+        let dev = dev as libc::dev_t;
+        DevNum { major: libc::major(dev) as u32, minor: libc::minor(dev) as u32 }
     }
 
     /// Parses `"8:17"`.
@@ -250,10 +250,15 @@ mod tests {
         assert_eq!(DevNum::parse(" 8:17\n"), Some(DevNum::new(8, 17)));
         assert_eq!(DevNum::parse("8"), None);
         assert_eq!(DevNum::parse("a:b"), None);
-        // Large numbers use the split encoding.
-        let dev = libc::makedev(4095 + 1, 300);
-        assert_eq!(DevNum::from_dev_t(dev), DevNum::new(4096, 300));
-        assert_eq!(DevNum::from_dev_t(libc::makedev(8, 17)), DevNum::new(8, 17));
         assert_eq!(DevNum::new(8, 17).to_string(), "8:17");
+    }
+
+    /// Large numbers use glibc's split encoding.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dev_t_numbers_are_split_as_glibc_splits_them() {
+        assert_eq!(DevNum::from_dev_t(libc::makedev(4095 + 1, 300)), DevNum::new(4096, 300));
+        assert_eq!(DevNum::from_dev_t(libc::makedev(8, 17)), DevNum::new(8, 17));
+        assert_eq!(DevNum::from_dev_t(0x0000_1234_5678_9abc), DevNum::new(0x189a, 0x2345_67bc));
     }
 }

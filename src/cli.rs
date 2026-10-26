@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::{Colors, Config, Escalation, LinuxSystem, Options, Report, System};
+use crate::{Colors, Config, Escalation, NativeSystem, Options, Report, System};
 
 /// Give each device a root link (`/<devmount>`) that follows it wherever the OS mounts it,
 /// plus links into it (`/<name> -> /<devmount>/<path>`) that go through that root link.
@@ -141,7 +141,7 @@ impl Cli {
 impl Command {
     /// Does what the subcommand says, on this machine; returns the exit status.
     pub fn run(self) -> u8 {
-        let system = LinuxSystem::from_env();
+        let system = NativeSystem::from_env();
         let exit = match self {
             Command::Apply(args) => report(crate::apply, args, false, &system),
             Command::Status(args) => report(crate::status, args, false, &system),
@@ -156,7 +156,7 @@ impl Command {
 
 type Operation = fn(&Config, &Options, &dyn System) -> crate::Result<Report>;
 
-fn report(operation: Operation, args: RunArgs, unmount: bool, system: &LinuxSystem) -> Exit {
+fn report(operation: Operation, args: RunArgs, unmount: bool, system: &dyn System) -> Exit {
     let Some(path) = args.config else {
         eprintln!("error: no CONFIG given (the TOML file describing the devices and links)");
         return Exit::CouldNotRun;
@@ -183,7 +183,7 @@ fn print_report(report: &Report, json: bool) -> Exit {
     if report.ok() { Exit::Clean } else { Exit::Problems }
 }
 
-fn list_devices(system: &LinuxSystem, json: bool) -> Exit {
+fn list_devices(system: &dyn System, json: bool) -> Exit {
     let listing = match crate::list_devices(system) {
         Ok(listing) => listing,
         Err(err) => return fatal(&err),
