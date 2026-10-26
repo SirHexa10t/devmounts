@@ -49,8 +49,11 @@ pub enum Command {
 /// What `apply` and `status` take.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct RunArgs {
+    // Required here, yet an `Option`: a program with a default of its own relaxes the requirement
+    // and fills it in. Left `None`, the run says the CONFIG is missing.
     /// TOML file describing the devices and links.
-    pub config: PathBuf,
+    #[arg(required = true)]
+    pub config: Option<PathBuf>,
     #[command(flatten)]
     pub flags: RunFlags,
 }
@@ -124,14 +127,12 @@ impl Cli {
         let command = match (self.command, self.config) {
             (Some(command), None) if self.flags == RunFlags::default() => command,
             (Some(_), _) => {
-                eprintln!("devmounts: options and the CONFIG go after the subcommand, as in `devmounts status --json <CONFIG>`");
+                eprintln!(
+                    "error: options and the CONFIG go after the subcommand, as in `devmounts status --json <CONFIG>`"
+                );
                 return Exit::CouldNotRun.code();
             }
-            (None, Some(config)) => Command::Apply(RunArgs { config, flags: self.flags }),
-            (None, None) => {
-                eprintln!("devmounts: which CONFIG? `devmounts <CONFIG>` applies one (see `devmounts --help`)");
-                return Exit::CouldNotRun.code();
-            }
+            (None, config) => Command::Apply(RunArgs { config, flags: self.flags }),
         };
         command.run()
     }
@@ -144,7 +145,9 @@ impl Command {
         let exit = match self {
             Command::Apply(args) => report(crate::apply, args, false, &system),
             Command::Status(args) => report(crate::status, args, false, &system),
-            Command::Remove(RemoveArgs { run, unmount }) => report(crate::remove, run, unmount, &system),
+            Command::Remove(RemoveArgs { run, unmount }) => {
+                report(crate::remove, run, unmount, &system)
+            }
             Command::Devices(DevicesArgs { json }) => list_devices(&system, json),
         };
         exit.code()
@@ -154,12 +157,17 @@ impl Command {
 type Operation = fn(&Config, &Options, &dyn System) -> crate::Result<Report>;
 
 fn report(operation: Operation, args: RunArgs, unmount: bool, system: &LinuxSystem) -> Exit {
-    let config = match Config::from_path(&args.config) {
+    let Some(path) = args.config else {
+        eprintln!("error: no CONFIG given (the TOML file describing the devices and links)");
+        return Exit::CouldNotRun;
+    };
+    let config = match Config::from_path(&path) {
         Ok(config) => config,
         Err(err) => return fatal(&err),
     };
     let RunFlags { dry_run, no_mount, force, root, escalate, json } = args.flags;
-    let options = Options { dry_run, force, no_mount, unmount, root, escalation: escalate, helper: None };
+    let options =
+        Options { dry_run, force, no_mount, unmount, root, escalation: escalate, helper: None };
     match operation(&config, &options, system) {
         Ok(report) => print_report(&report, json),
         Err(err) => fatal(&err),
@@ -185,7 +193,10 @@ fn list_devices(system: &LinuxSystem, json: bool) -> Exit {
         return Exit::Clean;
     }
     let dash = || "-".to_owned();
-    let mut rows = vec![["DEVICE", "TYPE", "LABEL", "UUID", "PARTUUID", "PARTLABEL", "MOUNTED AT"].map(String::from)];
+    let mut rows = vec![
+        ["DEVICE", "TYPE", "LABEL", "UUID", "PARTUUID", "PARTLABEL", "MOUNTED AT"]
+            .map(String::from),
+    ];
     for entry in &listing {
         let d = &entry.device;
         let mounts: Vec<String> = entry
@@ -209,25 +220,35 @@ fn list_devices(system: &LinuxSystem, json: bool) -> Exit {
             if mounts.is_empty() { dash() } else { mounts.join(", ") },
         ]);
     }
-    let widths: Vec<usize> = (0..7).map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0)).collect();
+    let widths: Vec<usize> =
+        (0..7).map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0)).collect();
     for row in rows {
-        let line: Vec<String> = row.iter().zip(&widths).map(|(cell, w)| format!("{cell:<w$}")).collect();
+        let line: Vec<String> =
+            row.iter().zip(&widths).map(|(cell, w)| format!("{cell:<w$}")).collect();
         println!("{}", line.join("  ").trim_end());
     }
     Exit::Clean
 }
 
+/// A run that can't run, said as clap says a usage error: `error: …`, never naming this program —
+/// through a program that offers a subcommand as a command of its own, the message is that
+/// command's, and its user needn't know what it's built on.
 fn fatal(err: &crate::Error) -> Exit {
-    eprintln!("devmounts: {err}");
+    eprintln!("error: {err}");
     Exit::CouldNotRun
 }
 
 fn plain_absolute(text: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(text);
-    if crate::config::is_plain_absolute(&path) { Ok(path) } else { Err("must be an absolute path without '..'".into()) }
+    if crate::config::is_plain_absolute(&path) {
+        Ok(path)
+    } else {
+        Err("must be an absolute path without '..'".into())
+    }
 }
 
-/// What `NO_COLOR` asks for (<https://no-color.org>): a value turns colour off, an empty one doesn't.
+/// What `NO_COLOR` asks for (<https://no-color.org>): a value turns colour off, an empty one
+/// doesn't.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoColor {
     Unset,
@@ -271,15 +292,26 @@ mod tests {
 
     #[test]
     fn each_subcommand_takes_its_own_config_and_options() {
-        let Some(Command::Remove(RemoveArgs { run, unmount: true })) = parse(&["remove", "--unmount", "--json", "c.toml"]).unwrap().command
+        let Some(Command::Remove(RemoveArgs { run, unmount: true })) =
+            parse(&["remove", "--unmount", "--json", "c.toml"]).unwrap().command
         else {
             panic!("a remove");
         };
-        assert_eq!(run, RunArgs { config: "c.toml".into(), flags: RunFlags { json: true, ..RunFlags::default() } });
+        assert_eq!(
+            run,
+            RunArgs {
+                config: Some("c.toml".into()),
+                flags: RunFlags { json: true, ..RunFlags::default() }
+            }
+        );
         let missing = parse(&["status"]).unwrap_err();
         assert!(missing.to_string().contains("<CONFIG>"), "{missing}");
         let bare = parse(&["c.toml", "-n"]).unwrap();
-        assert!(bare.command.is_none() && bare.config.as_deref() == Some(Path::new("c.toml")) && bare.flags.dry_run);
+        assert!(
+            bare.command.is_none()
+                && bare.config.as_deref() == Some(Path::new("c.toml"))
+                && bare.flags.dry_run
+        );
     }
 
     #[test]
@@ -299,6 +331,18 @@ mod tests {
         for argv in [&["--json", "status", "c.toml"][..], &["c.toml", "status", "d.toml"]] {
             assert_eq!(parse(argv).unwrap().run(), Exit::CouldNotRun.code(), "{argv:?}");
         }
+    }
+
+    /// A program that relaxes the CONFIG requirement and has no default to fill in gets devmounts'
+    /// own answer: a usage error, before anything is looked at.
+    #[test]
+    fn a_run_without_a_config_cannot_run() {
+        let args = RunArgs { config: None, flags: RunFlags::default() };
+        assert_eq!(Command::Apply(args.clone()).run(), Exit::CouldNotRun.code());
+        assert_eq!(
+            Command::Remove(RemoveArgs { run: args, unmount: false }).run(),
+            Exit::CouldNotRun.code()
+        );
     }
 
     #[test]

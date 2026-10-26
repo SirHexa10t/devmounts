@@ -34,7 +34,8 @@ pub fn parse_properties(text: &str) -> HashMap<String, String> {
 /// Picks the identifiers out of udev properties, preferring the losslessly encoded variants.
 pub fn identity(props: &HashMap<String, String>) -> Identity {
     let get = |key: &str| props.get(key).filter(|v| !v.is_empty());
-    let encoded = |enc: &str, plain: &str| get(enc).map(|v| decode(v)).or_else(|| get(plain).cloned());
+    let encoded =
+        |enc: &str, plain: &str| get(enc).map(|v| decode(v)).or_else(|| get(plain).cloned());
     Identity {
         fstype: get("ID_FS_TYPE").cloned(),
         uuid: encoded("ID_FS_UUID_ENC", "ID_FS_UUID"),
@@ -123,7 +124,11 @@ V:1
             "E:ID_FS_LABEL=Example_Drive\nE:ID_FS_LABEL_ENC=Example\\x20Drive\nE:ID_PART_ENTRY_NAME=EFI\\x20system\\x20partition\n",
         );
         let id = identity(&props);
-        assert_eq!(id.label.as_deref(), Some("Example Drive"), "the _ENC value wins over the mangled one");
+        assert_eq!(
+            id.label.as_deref(),
+            Some("Example Drive"),
+            "the _ENC value wins over the mangled one"
+        );
         assert_eq!(id.partlabel.as_deref(), Some("EFI system partition"));
     }
 

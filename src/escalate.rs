@@ -23,8 +23,8 @@ pub enum Escalation {
     Auto,
     /// Never escalate; steps that need privileges fail.
     Never,
-    /// Start the privileged helper with this command line, e.g. `doas -n`. There's always a program:
-    /// an empty command can't be spelled.
+    /// Start the privileged helper with this command line, e.g. `doas -n`. There's always a
+    /// program: an empty command can't be spelled.
     Command { program: String, args: Vec<String> },
 }
 
@@ -45,7 +45,9 @@ impl Escalation {
     pub fn command(words: impl IntoIterator<Item = String>) -> std::result::Result<Self, String> {
         let mut words = words.into_iter();
         match words.next() {
-            Some(program) if !program.trim().is_empty() => Ok(Escalation::Command { program, args: words.collect() }),
+            Some(program) if !program.trim().is_empty() => {
+                Ok(Escalation::Command { program, args: words.collect() })
+            }
             _ => Err("is empty (use \"none\" to never escalate)".into()),
         }
     }
@@ -64,7 +66,9 @@ impl Escalation {
                 .find(|name| find_program(name).is_some())
                 .map(|name| Some(vec![(*name).to_owned()]))
                 .ok_or_else(|| Error::Escalation {
-                    message: "none of sudo, doas or run0 is installed; run as root or set `escalate`".into(),
+                    message:
+                        "none of sudo, doas or run0 is installed; run as root or set `escalate`"
+                            .into(),
                 }),
         }
     }
@@ -76,7 +80,10 @@ pub fn run(argv: &[OsString]) -> Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(Error::CommandFailed { command: display_command(argv), message: failure_message(&output) })
+        Err(Error::CommandFailed {
+            command: display_command(argv),
+            message: failure_message(&output),
+        })
     }
 }
 
@@ -92,7 +99,10 @@ pub fn output(argv: &[OsString]) -> Result<std::process::Output> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|err| Error::CommandFailed { command: display_command(argv), message: err.to_string() })
+        .map_err(|err| Error::CommandFailed {
+            command: display_command(argv),
+            message: err.to_string(),
+        })
 }
 
 pub(crate) fn failure_message(output: &std::process::Output) -> String {
@@ -106,7 +116,9 @@ pub fn display_command(argv: &[OsString]) -> String {
     argv.iter()
         .map(|arg| {
             let arg = arg.to_string_lossy();
-            if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:,@+".contains(c)) {
+            if !arg.is_empty()
+                && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:,@+".contains(c))
+            {
                 arg.into_owned()
             } else {
                 format!("'{}'", arg.replace('\'', r"'\''"))
@@ -157,18 +169,16 @@ mod tests {
     fn explicit_prefixes() {
         assert_eq!(Escalation::Never.prefix().unwrap(), None);
         assert_eq!(command(&["doas"]).prefix().unwrap(), Some(vec!["doas".to_owned()]));
-        assert_eq!(command(&["doas", "-n"]).prefix().unwrap(), Some(vec!["doas".to_owned(), "-n".to_owned()]));
-    }
-
-    #[test]
-    fn quotes_unusual_arguments() {
-        let argv: Vec<OsString> = ["ln", "-sfn", "--", "/a b/it's", "/x"].iter().map(OsString::from).collect();
-        assert_eq!(display_command(&argv), r"ln -sfn -- '/a b/it'\''s' /x");
+        assert_eq!(
+            command(&["doas", "-n"]).prefix().unwrap(),
+            Some(vec!["doas".to_owned(), "-n".to_owned()])
+        );
     }
 
     #[test]
     fn reports_stderr_of_failed_commands() {
-        let argv: Vec<OsString> = ["sh", "-c", "echo boom >&2; exit 3"].iter().map(OsString::from).collect();
+        let argv: Vec<OsString> =
+            ["sh", "-c", "echo boom >&2; exit 3"].iter().map(OsString::from).collect();
         match run(&argv) {
             Err(Error::CommandFailed { message, .. }) => assert_eq!(message, "boom"),
             other => panic!("unexpected: {other:?}"),

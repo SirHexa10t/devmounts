@@ -18,7 +18,9 @@ use crate::link::{self, LinkState};
 use crate::mount;
 use crate::mountinfo::MountEntry;
 use crate::privileged::Privileges;
-use crate::report::{Command, DeviceReport, LinkOutcome, LinkReport, MountChange, MountSummary, Report};
+use crate::report::{
+    Command, DeviceReport, LinkOutcome, LinkReport, MountChange, MountSummary, Report,
+};
 use crate::resolve::{self, MountTree, ResolvedDevice};
 use crate::system::{BlockDevice, MountRequest, System, UnmountRequest};
 
@@ -75,18 +77,28 @@ pub fn list_devices(system: &dyn System) -> Result<Vec<DeviceListing>> {
     Ok(devices
         .into_iter()
         .map(|device| {
-            let single = ResolvedDevice { device: device.clone(), members: vec![device.clone()], containers: Vec::new() };
+            let single = ResolvedDevice {
+                device: device.clone(),
+                members: vec![device.clone()],
+                containers: Vec::new(),
+            };
             let mounts = resolve::device_mounts(&single, &tree, |p| system.device_number(p));
             DeviceListing { device, mounts: summarize(&mounts) }
         })
         .collect())
 }
 
-fn run(command: Command, config: &Config, options: &Options, system: &dyn System) -> Result<Report> {
+fn run(
+    command: Command,
+    config: &Config,
+    options: &Options,
+    system: &dyn System,
+) -> Result<Report> {
     if let Some(root) = &options.root
         && !is_plain_absolute(root)
     {
-        let problem = format!("the link root must be an absolute path without '..' (got {})", root.display());
+        let problem =
+            format!("the link root must be an absolute path without '..' (got {})", root.display());
         return Err(Error::ConfigInvalid { problems: vec![problem] });
     }
     let ctx = Context {
@@ -102,14 +114,20 @@ fn run(command: Command, config: &Config, options: &Options, system: &dyn System
             options.helper.clone(),
         ),
     };
-    let mut devices = Vec::new();
-    for spec in &config.devices {
-        devices.push(match command {
-            Command::Apply => ctx.apply_device(spec)?,
-            Command::Status => ctx.status_device(spec)?,
-            Command::Remove => ctx.remove_device(spec)?,
-        });
-    }
+    // A machine whose mount table can't be read stops the run here, before anything is changed.
+    // Each device reads the table again when its turn comes (one before it may have mounted or
+    // unmounted), and a read failing then is that device's problem: the report keeps everything
+    // done before it.
+    system.mounts()?;
+    let devices = config
+        .devices
+        .iter()
+        .map(|spec| match command {
+            Command::Apply => ctx.apply_device(spec),
+            Command::Status => ctx.status_device(spec),
+            Command::Remove => ctx.remove_device(spec),
+        })
+        .collect();
     Ok(Report { command, dry_run: options.dry_run, root: ctx.root, devices })
 }
 
@@ -135,7 +153,9 @@ struct Mounted<'t> {
 impl<'t> Mounted<'t> {
     fn new(ctx: &Context<'_>, device: Option<&ResolvedDevice>, table: &'t [MountEntry]) -> Self {
         let tree = MountTree::new(table);
-        let mounts = device.map(|d| resolve::device_mounts(d, &tree, |p| ctx.system.device_number(p))).unwrap_or_default();
+        let mounts = device
+            .map(|d| resolve::device_mounts(d, &tree, |p| ctx.system.device_number(p)))
+            .unwrap_or_default();
         let ids = mounts.iter().map(|m| m.id).collect();
         Mounted { tree, mounts, ids }
     }
@@ -147,7 +167,12 @@ impl<'t> Mounted<'t> {
 
     /// Whether a devmount pointing at `path` may be re-pointed: on the device, or where
     /// devices get mounted (a stale mount directory, or another device it was swapped for).
-    fn devmount_may_replace(&self, path: &Path, mount_base: &Path, automount_dirs: &[PathBuf]) -> bool {
+    fn devmount_may_replace(
+        &self,
+        path: &Path,
+        mount_base: &Path,
+        automount_dirs: &[PathBuf],
+    ) -> bool {
         self.on_device(path) || mount::is_mount_location(path, mount_base, automount_dirs)
     }
 
@@ -184,6 +209,18 @@ impl Context<'_> {
         }
     }
 
+    /// The mount table as it is now, or `None` with the failed read recorded as the device's
+    /// problem.
+    fn mount_table(&self, report: &mut DeviceReport) -> Option<Vec<MountEntry>> {
+        match self.system.mounts() {
+            Ok(table) => Some(table),
+            Err(err) => {
+                report.error = Some(err);
+                None
+            }
+        }
+    }
+
     /// The name check again, as the root may have been overridden to `/` at run time.
     fn check_name(&self, name: &str) -> Result<()> {
         validate_link_name(name, self.root == Path::new("/"))
@@ -192,16 +229,17 @@ impl Context<'_> {
 
     // --- apply ---------------------------------------------------------------------------
 
-    fn apply_device(&self, spec: &DeviceSpec) -> Result<DeviceReport> {
+    fn apply_device(&self, spec: &DeviceSpec) -> DeviceReport {
         let mut report = DeviceReport::new(&self.root, spec);
-        let Some(device) = self.find(spec, &mut report) else { return Ok(report) };
-
-        let mut table = self.system.mounts()?;
+        let Some(device) = self.find(spec, &mut report) else { return report };
+        let Some(mut table) = self.mount_table(&mut report) else { return report };
         // The devmount needs the device's root; mount it if no mount shows it. If the device
         // is mounted, but only in parts (btrfs subvolumes), its top level is mounted too.
         let needs_mount = {
             let mounted = Mounted::new(self, Some(&device), &table);
-            resolve::locate(&DevicePath::root(), &mounted.mounts).is_none().then_some(!mounted.mounts.is_empty())
+            resolve::locate(&DevicePath::root(), &mounted.mounts)
+                .is_none()
+                .then_some(!mounted.mounts.is_empty())
         };
         let mut pending = false;
         if let Some(top_level) = needs_mount
@@ -224,7 +262,9 @@ impl Context<'_> {
                 match self.system.mount(&request) {
                     Ok(()) => {
                         report.mount_changes.push(MountChange::Mounted { top_level });
-                        table = self.system.mounts()?;
+                        // Where it was mounted is only known from the table read again.
+                        let Some(mounted) = self.mount_table(&mut report) else { return report };
+                        table = mounted;
                     }
                     Err(err) => report.error = Some(err),
                 }
@@ -244,7 +284,7 @@ impl Context<'_> {
             Err(err) => report.devmount.clone().fail(err.clone()),
         };
         if !report.devmount.ok {
-            return Ok(report); // the mount links would lead nowhere (or somewhere wrong)
+            return report; // the mount links would lead nowhere (or somewhere wrong)
         }
 
         for (link, mount) in report.mounts.iter_mut().zip(&spec.mounts) {
@@ -257,12 +297,17 @@ impl Context<'_> {
             let target = spec.link_target(&self.root, &mount.path);
             *link = self.put_link(link.clone(), Some(&target), &on_device);
         }
-        Ok(report)
+        report
     }
 
     /// Makes `report.link` point at `target`. Without a target (dry run waiting for a mount)
     /// only reports roughly what would happen.
-    fn put_link(&self, mut report: LinkReport, target: Option<&Path>, on_device: &dyn Fn(&Path) -> bool) -> LinkReport {
+    fn put_link(
+        &self,
+        mut report: LinkReport,
+        target: Option<&Path>,
+        on_device: &dyn Fn(&Path) -> bool,
+    ) -> LinkReport {
         if let Err(err) = self.check_name(&report.name) {
             return report.fail(err);
         }
@@ -295,16 +340,17 @@ impl Context<'_> {
             return report.finish(planned, true);
         };
         match link::set_link(&report.link, target, &self.privileges) {
-            Ok(()) => report.finish(if create { LinkOutcome::Created } else { LinkOutcome::Updated }, true),
+            Ok(()) => report
+                .finish(if create { LinkOutcome::Created } else { LinkOutcome::Updated }, true),
             Err(err) => report.fail(err),
         }
     }
 
     // --- status --------------------------------------------------------------------------
 
-    fn status_device(&self, spec: &DeviceSpec) -> Result<DeviceReport> {
+    fn status_device(&self, spec: &DeviceSpec) -> DeviceReport {
         let mut report = DeviceReport::new(&self.root, spec);
-        let table = self.system.mounts()?;
+        let Some(table) = self.mount_table(&mut report) else { return report };
         let found = self.find(spec, &mut report);
         let mounted = Mounted::new(self, found.as_ref(), &table);
         report.mounted_at = summarize(&mounted.mounts);
@@ -317,7 +363,8 @@ impl Context<'_> {
             None => Ok(None),
             Some(device) => mounted.device_root(device).map(Some),
         };
-        report.devmount = self.check_link(report.devmount.clone(), device_root.clone(), &devmount_owned);
+        report.devmount =
+            self.check_link(report.devmount.clone(), device_root.clone(), &devmount_owned);
 
         for (link, mount) in report.mounts.iter_mut().zip(&spec.mounts) {
             let target = spec.link_target(&self.root, &mount.path);
@@ -327,7 +374,7 @@ impl Context<'_> {
             };
             *link = self.check_link(link.clone(), expected, &on_device);
         }
-        Ok(report)
+        report
     }
 
     fn check_link(
@@ -364,9 +411,9 @@ impl Context<'_> {
 
     // --- remove --------------------------------------------------------------------------
 
-    fn remove_device(&self, spec: &DeviceSpec) -> Result<DeviceReport> {
+    fn remove_device(&self, spec: &DeviceSpec) -> DeviceReport {
         let mut report = DeviceReport::new(&self.root, spec);
-        let table = self.system.mounts()?;
+        let Some(table) = self.mount_table(&mut report) else { return report };
         let found = self.find(spec, &mut report);
         let mounted = Mounted::new(self, found.as_ref(), &table);
         let on_device = |p: &Path| mounted.on_device(p);
@@ -384,15 +431,23 @@ impl Context<'_> {
             && let Some(device) = &found
         {
             self.unmount_device(device, &mounted.mounts, &mut report);
-            let table = self.system.mounts()?;
-            report.mounted_at = summarize(&Mounted::new(self, Some(device), &table).mounts);
+            // Where it's still mounted is only known from the table read again; each unmount's
+            // own outcome is recorded already, so a failed read takes nothing with it.
+            if let Some(table) = self.mount_table(&mut report) {
+                report.mounted_at = summarize(&Mounted::new(self, Some(device), &table).mounts);
+            }
         } else {
             report.mounted_at = summarize(&mounted.mounts);
         }
-        Ok(report)
+        report
     }
 
-    fn take_down(&self, mut report: LinkReport, target: Option<&Path>, on_device: &dyn Fn(&Path) -> bool) -> LinkReport {
+    fn take_down(
+        &self,
+        mut report: LinkReport,
+        target: Option<&Path>,
+        on_device: &dyn Fn(&Path) -> bool,
+    ) -> LinkReport {
         if let Err(err) = self.check_name(&report.name) {
             return report.fail(err);
         }
@@ -422,7 +477,12 @@ impl Context<'_> {
         }
     }
 
-    fn unmount_device(&self, device: &ResolvedDevice, mounts: &[&MountEntry], report: &mut DeviceReport) {
+    fn unmount_device(
+        &self,
+        device: &ResolvedDevice,
+        mounts: &[&MountEntry],
+        report: &mut DeviceReport,
+    ) {
         let base = &self.config.settings.mount_base;
         let mut ordered: Vec<&MountEntry> = mounts.to_vec();
         // Deepest first, so nested mounts don't keep their parents busy.
@@ -437,13 +497,16 @@ impl Context<'_> {
                 let request = UnmountRequest {
                     device: &device.device,
                     mount,
+                    method: self.config.settings.mount_method,
                     mount_base: base.clone(),
                     privileges: &self.privileges,
                 };
-                match self.system.unmount(&request) {
-                    Ok(()) => report.mount_changes.push(MountChange::Unmounted { mount_point }),
-                    Err(err) => report.error = Some(err),
-                }
+                // Each mount's outcome is its own: one failing doesn't hide another, nor stop it
+                // being tried.
+                report.mount_changes.push(match self.system.unmount(&request) {
+                    Ok(()) => MountChange::Unmounted { mount_point },
+                    Err(error) => MountChange::UnmountFailed { mount_point, error },
+                });
             }
         }
     }
@@ -451,7 +514,9 @@ impl Context<'_> {
 
 fn current_of(state: &LinkState) -> Option<PathBuf> {
     match state {
-        LinkState::Dangling { current } | LinkState::Elsewhere { current, .. } => Some(current.clone()),
+        LinkState::Dangling { current } | LinkState::Elsewhere { current, .. } => {
+            Some(current.clone())
+        }
         _ => None,
     }
 }
@@ -461,7 +526,11 @@ fn unreachable_error(device: &ResolvedDevice, mounts: &[&MountEntry]) -> Error {
     if mounts.is_empty() {
         Error::NotMounted { device: name }
     } else {
-        Error::PathNotExposed { device: name, path: ".".into(), exposed: resolve::exposed_parts(mounts) }
+        Error::PathNotExposed {
+            device: name,
+            path: ".".into(),
+            exposed: resolve::exposed_parts(mounts),
+        }
     }
 }
 

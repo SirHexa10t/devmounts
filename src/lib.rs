@@ -48,6 +48,10 @@ pub use escalate::Escalation;
 pub use link::LinkState;
 pub use mountinfo::{DevNum, MountEntry};
 pub use privileged::Privileges;
-pub use report::{Colors, Command, DeviceReport, LinkOutcome, LinkReport, MountChange, MountSummary, Report};
-pub use resolve::{Location, MountTree, ResolvedDevice, check_target, device_mounts, find_device, locate};
+pub use report::{
+    Colors, Command, DeviceReport, LinkOutcome, LinkReport, MountChange, MountSummary, Report,
+};
+pub use resolve::{
+    Location, MountTree, ResolvedDevice, check_target, device_mounts, find_device, locate,
+};
 pub use system::{BlockDevice, LinuxSystem, MountRequest, System, UnmountRequest};

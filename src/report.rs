@@ -37,8 +37,9 @@ pub struct DeviceReport {
     pub containers: Vec<String>,
     /// Where the device's filesystem is mounted (after any mounting done in this run).
     pub mounted_at: Vec<MountSummary>,
+    /// What this run mounted and unmounted, or would (dry run) — every unmount's outcome its own.
     pub mount_changes: Vec<MountChange>,
-    /// A device-level problem (not found, ambiguous, mount failed, …).
+    /// A device-level problem (not found, ambiguous, mount failed, the mount table unreadable, …).
     pub error: Option<Error>,
     /// The device's root link.
     pub devmount: LinkReport,
@@ -59,12 +60,34 @@ pub struct MountSummary {
 #[serde(tag = "change", rename_all = "snake_case")]
 pub enum MountChange {
     /// Mounted in this run; `top_level` when added next to existing (subvolume) mounts.
-    Mounted { top_level: bool },
-    WouldMount { top_level: bool },
-    Unmounted { mount_point: PathBuf },
-    WouldUnmount { mount_point: PathBuf },
+    Mounted {
+        top_level: bool,
+    },
+    WouldMount {
+        top_level: bool,
+    },
+    Unmounted {
+        mount_point: PathBuf,
+    },
+    WouldUnmount {
+        mount_point: PathBuf,
+    },
+    /// Unmounting it failed; the device's other mounts were still tried.
+    UnmountFailed {
+        mount_point: PathBuf,
+        error: Error,
+    },
     /// Not ours to unmount: neither an automounter's mount nor one devmounts made (fstab, system).
-    LeftMounted { mount_point: PathBuf },
+    LeftMounted {
+        mount_point: PathBuf,
+    },
+}
+
+impl MountChange {
+    /// Whether this change counts as a problem: an unmount that failed.
+    pub fn is_problem(&self) -> bool {
+        matches!(self, MountChange::UnmountFailed { .. })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,7 +131,9 @@ pub enum LinkOutcome {
     Outdated,
     /// Not looked at because of a problem with the device or its devmount.
     Skipped,
-    Failed { error: Error },
+    Failed {
+        error: Error,
+    },
 }
 
 impl LinkReport {
@@ -156,9 +181,12 @@ impl DeviceReport {
         self.problems() == 0
     }
 
-    /// The device-level error, if any, plus every link that is a problem.
+    /// The device-level error, if any, plus every failed unmount and every link that is a problem.
     pub fn problems(&self) -> usize {
-        usize::from(self.error.is_some()) + self.links().filter(|link| link.is_problem()).count()
+        let changes = self.mount_changes.iter().filter(|change| change.is_problem()).count();
+        usize::from(self.error.is_some())
+            + changes
+            + self.links().filter(|link| link.is_problem()).count()
     }
 
     /// The devmount, then the mount links.
@@ -244,7 +272,11 @@ fn render_device(out: &mut String, s: &Style, device: &DeviceReport, dry_run: bo
         let _ = writeln!(out, "  {}", s.dim(&format!("inside {container}")));
     }
     if device.not_connected && device.error.is_none() {
-        let handled = if dry_run { "would be taken down all the same" } else { "are taken down all the same" };
+        let handled = if dry_run {
+            "would be taken down all the same"
+        } else {
+            "are taken down all the same"
+        };
         let _ = writeln!(out, "  {}", s.note(&format!("• not connected — its links {handled}")));
     }
 
@@ -255,8 +287,13 @@ fn render_device(out: &mut String, s: &Style, device: &DeviceReport, dry_run: bo
             MountChange::Mounted { top_level: true } => s.good("mounted its top level"),
             MountChange::WouldMount { top_level: false } => s.note("would mount it"),
             MountChange::WouldMount { top_level: true } => s.note("would mount its top level"),
-            MountChange::Unmounted { mount_point } => s.good(&format!("unmounted {}", mount_point.display())),
-            MountChange::WouldUnmount { mount_point } => s.note(&format!("would unmount {}", mount_point.display())),
+            MountChange::Unmounted { mount_point } => {
+                s.good(&format!("unmounted {}", mount_point.display()))
+            }
+            MountChange::WouldUnmount { mount_point } => {
+                s.note(&format!("would unmount {}", mount_point.display()))
+            }
+            MountChange::UnmountFailed { error, .. } => format!("{} {error}", s.bad("✗")),
             MountChange::LeftMounted { mount_point } => {
                 left.push(mount_point.display().to_string());
                 continue;
@@ -265,7 +302,14 @@ fn render_device(out: &mut String, s: &Style, device: &DeviceReport, dry_run: bo
         let _ = writeln!(out, "  {line}");
     }
     if !left.is_empty() {
-        let _ = writeln!(out, "  {}", s.dim(&format!("left mounted (not mounted by devmounts or an automounter): {}", left.join(", "))));
+        let _ = writeln!(
+            out,
+            "  {}",
+            s.dim(&format!(
+                "left mounted (not mounted by devmounts or an automounter): {}",
+                left.join(", ")
+            ))
+        );
     }
     if !device.mounted_at.is_empty() {
         let mounts: Vec<String> = device.mounted_at.iter().map(describe_mount).collect();
@@ -301,13 +345,16 @@ fn render_link(out: &mut String, s: &Style, link: &LinkReport, indent: &str) {
         Some(path) => format!(" → {}", path.display()),
         None => String::new(),
     };
-    let was = || link.current.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "?".into());
+    let was =
+        || link.current.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "?".into());
     let (mark, what) = match &link.outcome {
         LinkOutcome::Unchanged => (s.good("✓"), s.dim("ok")),
         LinkOutcome::Created => (s.good("✓"), s.good("created")),
         LinkOutcome::Updated => (s.good("✓"), s.good(&format!("updated (was {})", was()))),
         LinkOutcome::Removed => (s.good("✓"), s.good("removed")),
-        LinkOutcome::WouldCreate if link.target.is_none() => (s.note("•"), s.note("would create once mounted")),
+        LinkOutcome::WouldCreate if link.target.is_none() => {
+            (s.note("•"), s.note("would create once mounted"))
+        }
         LinkOutcome::WouldCreate => (s.note("•"), s.note("would create")),
         LinkOutcome::WouldUpdate => (s.note("•"), s.note(&format!("would update (was {})", was()))),
         LinkOutcome::WouldRemove => (s.note("•"), s.note("would remove")),

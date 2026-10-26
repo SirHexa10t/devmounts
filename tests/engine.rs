@@ -7,7 +7,9 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use common::{FakeSystem, device, mkdir, tmpdir};
-use devmounts::{Colors, Config, Error, Escalation, LinkOutcome, LinkReport, MountChange, Options, Report};
+use devmounts::{
+    Colors, Config, Error, Escalation, LinkOutcome, LinkReport, MountChange, Options, Report,
+};
 use tempfile::TempDir;
 
 struct Setup {
@@ -58,7 +60,9 @@ impl Setup {
     }
 
     fn config(&self, devices: &str) -> Config {
-        format!("[settings]\nroot = {:?}\nmount_base = {:?}\n{devices}", self.root, self.mnt).parse().unwrap()
+        format!("[settings]\nroot = {:?}\nmount_base = {:?}\n{devices}", self.root, self.mnt)
+            .parse()
+            .unwrap()
     }
 
     /// `[[device]]` with an id line, a devmount and a mounts table.
@@ -109,10 +113,17 @@ fn read_link(path: &Path) -> PathBuf {
 fn mounts_go_through_the_devmount() {
     let s = Setup::new();
     let data = s.mount_data(&["backups", "photos/2024"]);
-    let config = s.config(&s.device("label = 'DATA'", "data", "backups = 'backups', pics = '/photos/2024/'"));
+    let config = s.config(&s.device(
+        "label = 'DATA'",
+        "data",
+        "backups = 'backups', pics = '/photos/2024/'",
+    ));
 
     let report = s.apply(&config, &opts());
-    assert_eq!(outcomes(&report), pairs(&[("data", "created"), ("backups", "created"), ("pics", "created")]));
+    assert_eq!(
+        outcomes(&report),
+        pairs(&[("data", "created"), ("backups", "created"), ("pics", "created")])
+    );
     assert!(report.ok());
     assert_eq!(read_link(&s.link("data")), data);
     assert_eq!(read_link(&s.link("backups")), s.root.join("data/backups"));
@@ -121,7 +132,10 @@ fn mounts_go_through_the_devmount() {
     assert_eq!(report.devices[0].mounted_at.len(), 1);
 
     let again = s.apply(&config, &opts());
-    assert_eq!(outcomes(&again), pairs(&[("data", "unchanged"), ("backups", "unchanged"), ("pics", "unchanged")]));
+    assert_eq!(
+        outcomes(&again),
+        pairs(&[("data", "unchanged"), ("backups", "unchanged"), ("pics", "unchanged")])
+    );
     assert!(s.sys.calls.borrow().is_empty(), "nothing needed mounting");
 }
 
@@ -255,11 +269,18 @@ fn old_style_and_stale_links_are_updated() {
     // Dangling: the device used to be mounted somewhere else.
     symlink(s.media.join("OLD/a"), s.link("w")).unwrap();
 
-    let config = s.config(&s.device("label = 'DATA'", "data", "x = 'a', y = 'a', z = 'a', w = 'a'"));
+    let config =
+        s.config(&s.device("label = 'DATA'", "data", "x = 'a', y = 'a', z = 'a', w = 'a'"));
     let report = s.apply(&config, &opts());
     assert_eq!(
         outcomes(&report),
-        pairs(&[("data", "created"), ("x", "updated"), ("y", "updated"), ("z", "updated"), ("w", "updated")])
+        pairs(&[
+            ("data", "created"),
+            ("x", "updated"),
+            ("y", "updated"),
+            ("z", "updated"),
+            ("w", "updated")
+        ])
     );
     for name in ["x", "y", "z", "w"] {
         assert_eq!(read_link(&s.link(name)), s.root.join("data/a"), "{name}");
@@ -303,7 +324,8 @@ fn non_symlinks_are_never_touched() {
     fs::write(s.link("file"), "keep me").unwrap();
     for force in [false, true] {
         let options = Options { force, ..opts() };
-        let report = s.apply(&s.config(&s.device("label = 'DATA'", "data", "file = 'a'")), &options);
+        let report =
+            s.apply(&s.config(&s.device("label = 'DATA'", "data", "file = 'a'")), &options);
         assert_eq!(outcome(&report.devices[0].mounts[0]), "failed:link_blocked");
         let report = s.apply(&s.config(&s.device("label = 'DATA'", "dir", "m = 'a'")), &options);
         assert_eq!(outcomes(&report), pairs(&[("dir", "failed:link_blocked"), ("m", "skipped")]));
@@ -413,7 +435,11 @@ fn status_reports_without_changing_anything() {
     );
     assert!(!report.ok());
     assert!(report.devices[1].not_connected);
-    assert_eq!(report.devices[1].error.as_ref().map(Error::kind), Some("device_not_found"), "a problem for status");
+    assert_eq!(
+        report.devices[1].error.as_ref().map(Error::kind),
+        Some("device_not_found"),
+        "a problem for status"
+    );
     assert!(!s.link("b").exists(), "status doesn't create links");
     assert_eq!(read_link(&s.link("c")), data.join("c"));
 }
@@ -428,7 +454,11 @@ fn remove_takes_down_only_our_links() {
     symlink(s.media.join("gone/b"), s.link("b")).unwrap();
     symlink(&elsewhere, s.link("c")).unwrap();
     mkdir(&s.root, "d");
-    let config = s.config(&s.device("label = 'DATA'", "data", "a = 'a', b = 'b', c = 'a', d = 'a', e = 'a'"));
+    let config = s.config(&s.device(
+        "label = 'DATA'",
+        "data",
+        "a = 'a', b = 'b', c = 'a', d = 'a', e = 'a'",
+    ));
 
     let report = devmounts::remove(&config, &opts(), &s.sys).unwrap();
     assert_eq!(
@@ -460,7 +490,10 @@ fn remove_works_while_the_device_is_unplugged() {
     let report = devmounts::remove(&config, &opts(), &s.sys).unwrap();
     assert_eq!(outcomes(&report), pairs(&[("data", "removed"), ("a", "removed")]));
     let device = &report.devices[0];
-    assert!(device.not_connected && device.error.is_none(), "not connected is no failure for remove");
+    assert!(
+        device.not_connected && device.error.is_none(),
+        "not connected is no failure for remove"
+    );
     assert!(report.ok());
     let text = report.render(Colors::Plain);
     assert!(text.contains("• not connected — its links are taken down all the same"), "{text}");
@@ -482,14 +515,21 @@ fn remove_and_unmount() {
     symlink(&data, s.link("data")).unwrap();
     let config = s.config(&s.device("label = 'DATA'", "data", ""));
 
-    let dry = devmounts::remove(&config, &Options { unmount: true, dry_run: true, ..opts() }, &s.sys).unwrap();
-    assert!(dry.devices[0].mount_changes.contains(&MountChange::WouldUnmount { mount_point: data.clone() }));
+    let dry =
+        devmounts::remove(&config, &Options { unmount: true, dry_run: true, ..opts() }, &s.sys)
+            .unwrap();
+    assert!(
+        dry.devices[0]
+            .mount_changes
+            .contains(&MountChange::WouldUnmount { mount_point: data.clone() })
+    );
     assert!(s.sys.calls.borrow().is_empty());
 
     let report = devmounts::remove(&config, &Options { unmount: true, ..opts() }, &s.sys).unwrap();
     let mut unmounted = s.sys.calls.borrow().clone();
     unmounted.sort();
-    let mut expected = [format!("unmount {}", data.display()), format!("unmount {}", own.display())];
+    let mut expected =
+        [format!("unmount {}", data.display()), format!("unmount {}", own.display())];
     expected.sort();
     assert_eq!(unmounted, expected, "the automounter's mount and devmounts' own");
     let changes = &report.devices[0].mount_changes;
@@ -498,6 +538,140 @@ fn remove_and_unmount() {
     assert!(changes.contains(&MountChange::LeftMounted { mount_point: fstab.clone() }));
     assert!(changes.contains(&MountChange::LeftMounted { mount_point: fixed.clone() }));
     assert_eq!(report.devices[0].mounted_at.len(), 2, "the fstab mount and the fixed one are left");
+}
+
+/// A machine whose mount table can't be read at all can't be run against: every command stops
+/// before anything is changed, as for a config that doesn't parse.
+#[test]
+fn a_mount_table_unreadable_from_the_start_stops_the_run_before_anything_changes() {
+    let s = Setup::new();
+    s.mount_data(&["a"]);
+    let config = s.config(&s.device("label = 'DATA'", "data", "a = 'a'"));
+    for run in [devmounts::apply, devmounts::status, devmounts::remove] {
+        s.sys.mount_table_reads.set(Some(0));
+        let result = run(&config, &Options { unmount: true, ..opts() }, &s.sys);
+        assert!(matches!(result, Err(Error::MountTable { .. })), "{result:?}");
+    }
+    assert!(fs::read_dir(&s.root).unwrap().next().is_none(), "nothing was linked");
+    assert!(s.sys.calls.borrow().is_empty(), "nothing was mounted or unmounted");
+}
+
+/// The mount table becoming unreadable partway through a run is the problem of each device from
+/// there on, and of nothing before: the report keeps every change already made. The table is read
+/// once before the run and once per device, so two reads take the run through its first device.
+#[test]
+fn a_mount_table_unreadable_partway_fails_only_the_devices_from_there_on() {
+    let s = Setup::new();
+    s.mount_data(&["a"]);
+    s.mount("sdz1", "OTHER", &["b"]);
+    let config = s.config(&format!(
+        "{}{}",
+        s.device("label = 'DATA'", "data", "a = 'a'"),
+        s.device("label = 'OTHER'", "other", "b = 'b'")
+    ));
+    let unreadable = |device: &devmounts::DeviceReport| {
+        device.error.as_ref().map(Error::kind) == Some("mount_table")
+    };
+
+    s.sys.mount_table_reads.set(Some(2));
+    let applied = s.apply(&config, &opts());
+    assert_eq!(
+        outcomes(&applied),
+        pairs(&[("data", "created"), ("a", "created"), ("other", "skipped"), ("b", "skipped")])
+    );
+    assert!(unreadable(&applied.devices[1]) && applied.problems() == 1, "{applied:?}");
+    assert!(!s.link("other").exists());
+
+    s.sys.mount_table_reads.set(None);
+    assert!(s.apply(&config, &opts()).ok(), "readable again, the rest is linked");
+    s.sys.mount_table_reads.set(Some(2));
+    let status = devmounts::status(&config, &opts(), &s.sys).unwrap();
+    assert_eq!(
+        outcomes(&status),
+        pairs(&[("data", "unchanged"), ("a", "unchanged"), ("other", "skipped"), ("b", "skipped")])
+    );
+    assert!(unreadable(&status.devices[1]) && status.problems() == 1, "{status:?}");
+
+    s.sys.mount_table_reads.set(Some(2));
+    let removed = devmounts::remove(&config, &opts(), &s.sys).unwrap();
+    assert_eq!(
+        outcomes(&removed),
+        pairs(&[("data", "removed"), ("a", "removed"), ("other", "skipped"), ("b", "skipped")])
+    );
+    assert!(unreadable(&removed.devices[1]) && removed.problems() == 1, "{removed:?}");
+    assert!(
+        s.link("other").is_symlink() && !s.link("data").exists(),
+        "only the first device's links came down"
+    );
+}
+
+/// A read failing right after devmounts mounted a device leaves the mount in the report: it
+/// happened, even though where is no longer known and the links can't be set.
+#[test]
+fn a_mount_table_unreadable_right_after_mounting_still_reports_the_mount() {
+    let s = Setup::new();
+    let config = s.config(&s.device("label = 'DATA'", "data", "a = 'a'"));
+    s.sys.mount_table_reads.set(Some(2)); // before the run and the device's own; not the next
+    let report = s.apply(&config, &opts());
+    let device = &report.devices[0];
+    assert_eq!(device.mount_changes, [MountChange::Mounted { top_level: false }]);
+    assert_eq!(device.error.as_ref().map(Error::kind), Some("mount_table"));
+    assert_eq!(outcomes(&report), pairs(&[("data", "skipped"), ("a", "skipped")]));
+    assert_eq!(*s.sys.calls.borrow(), ["mount sdb1 [] top_level=false"]);
+    assert!(report.render(Colors::Plain).contains("mounted it"));
+}
+
+/// Likewise after unmounting: each unmount is in the report, and where the device is still
+/// mounted is left unsaid rather than guessed.
+#[test]
+fn a_mount_table_unreadable_after_unmounting_keeps_every_unmount_in_the_report() {
+    let s = Setup::new();
+    let data = s.mount_data(&[]);
+    let config = s.config(&s.device("label = 'DATA'", "data", ""));
+    s.sys.mount_table_reads.set(Some(2));
+    let report = devmounts::remove(&config, &Options { unmount: true, ..opts() }, &s.sys).unwrap();
+    let device = &report.devices[0];
+    assert_eq!(device.mount_changes, [MountChange::Unmounted { mount_point: data }]);
+    assert_eq!(device.error.as_ref().map(Error::kind), Some("mount_table"));
+    assert!(device.mounted_at.is_empty());
+}
+
+/// Each mount's unmount is an outcome of its own: two failing are both reported — neither hides
+/// the other or stops it being tried — and each counts as a problem.
+#[test]
+fn every_failed_unmount_is_reported_and_the_rest_still_tried() {
+    let mut s = Setup::new();
+    let data = s.mount_data(&[]);
+    let own = mkdir(&s.mnt, "uuid-data");
+    s.sys.add_mount("sdb1", "/", &own);
+    s.sys.fail_unmounts = true;
+    let config = s.config(&s.device("label = 'DATA'", "data", ""));
+    let report = devmounts::remove(&config, &Options { unmount: true, ..opts() }, &s.sys).unwrap();
+
+    let mut failed: Vec<PathBuf> = report.devices[0]
+        .mount_changes
+        .iter()
+        .filter_map(|change| match change {
+            MountChange::UnmountFailed { mount_point, error } => {
+                assert_eq!(error.kind(), "unmount_failed");
+                Some(mount_point.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    failed.sort();
+    let mut expected = vec![data, own];
+    expected.sort();
+    assert_eq!(failed, expected);
+    assert_eq!(s.sys.calls.borrow().len(), 2, "both were tried");
+    assert!(report.devices[0].error.is_none(), "no device-level problem");
+    assert_eq!(report.problems(), 2);
+    let text = report.render(Colors::Plain);
+    assert_eq!(text.matches("✗ unmounting ").count(), 2, "{text}");
+    assert!(text.ends_with("✗ 2 problems — see the ✗ lines above\n"), "{text}");
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["devices"][0]["mount_changes"][0]["change"], "unmount_failed");
+    assert_eq!(json["devices"][0]["mount_changes"][0]["error"]["kind"], "unmount_failed");
 }
 
 #[test]
@@ -510,7 +684,10 @@ fn one_failing_device_does_not_stop_the_others() {
         s.device("label = 'DATA'", "data", "d = 'a'")
     ));
     let report = s.apply(&config, &opts());
-    assert_eq!(outcomes(&report), pairs(&[("gone", "skipped"), ("m", "skipped"), ("data", "created"), ("d", "created")]));
+    assert_eq!(
+        outcomes(&report),
+        pairs(&[("gone", "skipped"), ("m", "skipped"), ("data", "created"), ("d", "created")])
+    );
     assert!(!report.ok());
     assert!(report.devices[1].ok());
 }
@@ -526,7 +703,10 @@ fn reserved_names_are_checked_against_the_runtime_root() {
     let slash = Options { root: Some("/".into()), ..opts() };
     let applied = s.apply(&config, &slash);
     assert_eq!(outcomes(&applied), pairs(&[("usr", "failed:config_invalid"), ("bin", "skipped")]));
-    for report in [devmounts::status(&config, &slash, &s.sys).unwrap(), devmounts::remove(&config, &slash, &s.sys).unwrap()] {
+    for report in [
+        devmounts::status(&config, &slash, &s.sys).unwrap(),
+        devmounts::remove(&config, &slash, &s.sys).unwrap(),
+    ] {
         assert_eq!(
             outcomes(&report),
             pairs(&[("usr", "failed:config_invalid"), ("bin", "failed:config_invalid")]),
@@ -541,7 +721,8 @@ fn root_overrides_must_be_absolute_and_free_of_dotdot() {
     let s = Setup::new();
     let config = s.config(&s.device("label = 'DATA'", "data", ""));
     for bad in ["links", "/tmp/.."] {
-        let result = devmounts::apply(&config, &Options { root: Some(bad.into()), ..opts() }, &s.sys);
+        let result =
+            devmounts::apply(&config, &Options { root: Some(bad.into()), ..opts() }, &s.sys);
         assert!(matches!(result, Err(Error::ConfigInvalid { .. })), "{bad}");
     }
 }
@@ -576,7 +757,11 @@ fn fake_sudo(s: &Setup, name: &str) -> PathBuf {
 }
 
 fn escalation_log(s: &Setup) -> Vec<String> {
-    fs::read_to_string(s.base.join("escalation.log")).unwrap_or_default().lines().map(str::to_owned).collect()
+    fs::read_to_string(s.base.join("escalation.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Every privileged step of a run goes through one helper, so a run asks for a password at most
@@ -610,7 +795,11 @@ fn permission_errors_go_through_one_privileged_helper_per_run() {
     assert_eq!(outcomes(&removed), pairs(&[("data", "removed"), ("a", "removed")]));
     assert!(!s.link("data").is_symlink() && !s.link("a").is_symlink());
     let started = format!("{} --devmounts-privileged-helper", helper.display());
-    assert_eq!(escalation_log(&s), [started.clone(), started], "one helper per run, however many steps");
+    assert_eq!(
+        escalation_log(&s),
+        [started.clone(), started],
+        "one helper per run, however many steps"
+    );
 }
 
 /// An escalation that's refused — a wrong password, say — is tried once. Every privileged step of
@@ -644,10 +833,16 @@ fn a_refused_escalation_is_tried_once_and_every_privileged_step_says_so() {
     let report = s.apply(&config, &options);
     fs::set_permissions(&s.root, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert_eq!(outcomes(&report), pairs(&[("data", "failed:escalation"), ("a", "skipped"), ("other", "failed:escalation")]));
+    assert_eq!(
+        outcomes(&report),
+        pairs(&[("data", "failed:escalation"), ("a", "skipped"), ("other", "failed:escalation")])
+    );
     assert_eq!(escalation_log(&s), ["refused"], "asked once for the whole run");
     let text = report.render(Colors::Plain);
-    assert!(text.contains("can't get privileges: `") && text.contains("` ended without answering"), "{text}");
+    assert!(
+        text.contains("can't get privileges: `") && text.contains("` ended without answering"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -658,7 +853,14 @@ fn reports_render_and_serialize() {
     let report = s.apply(&config, &opts());
     let text = report.render(Colors::Plain);
     assert!(text.contains("LABEL=\"DATA\" → /dev/sdb1 (ext4 \"DATA\")"), "{text}");
-    assert!(text.contains(&format!("    ✓ {} → {}  created", s.link("a").display(), s.root.join("data/a").display())), "{text}");
+    assert!(
+        text.contains(&format!(
+            "    ✓ {} → {}  created",
+            s.link("a").display(),
+            s.root.join("data/a").display()
+        )),
+        "{text}"
+    );
     assert!(text.contains("doesn't exist"), "{text}");
     assert!(text.ends_with("✗ 1 problem — see the ✗ line above\n"), "{text}");
     assert_eq!(report.problems(), 1);

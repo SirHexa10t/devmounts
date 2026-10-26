@@ -36,7 +36,11 @@ pub enum LinkState {
 
 /// Looks at `link`. `target` is the wanted target, if known; `on_device` says whether a
 /// resolved path lies on the link's device.
-pub fn inspect(link: &Path, target: Option<&Path>, on_device: impl Fn(&Path) -> bool) -> Result<LinkState> {
+pub fn inspect(
+    link: &Path,
+    target: Option<&Path>,
+    on_device: impl Fn(&Path) -> bool,
+) -> Result<LinkState> {
     let meta = match fs::symlink_metadata(link) {
         Ok(meta) => meta,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(LinkState::Missing),
@@ -45,7 +49,8 @@ pub fn inspect(link: &Path, target: Option<&Path>, on_device: impl Fn(&Path) -> 
     if !meta.file_type().is_symlink() {
         return Ok(LinkState::Blocked { kind: kind_name(&meta).into() });
     }
-    let raw = fs::read_link(link).map_err(|err| Error::io(format!("can't read {}", link.display()), &err))?;
+    let raw = fs::read_link(link)
+        .map_err(|err| Error::io(format!("can't read {}", link.display()), &err))?;
     // A relative link is relative to the directory it's in.
     let current = match link.parent() {
         Some(parent) if raw.is_relative() => parent.join(&raw),
@@ -56,7 +61,9 @@ pub fn inspect(link: &Path, target: Option<&Path>, on_device: impl Fn(&Path) -> 
     }
     match fs::canonicalize(link) {
         Ok(resolved) => Ok(LinkState::Elsewhere { on_device: on_device(&resolved), current }),
-        Err(err) if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+        Err(err)
+            if matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) =>
+        {
             Ok(LinkState::Dangling { current })
         }
         // Loops, permission problems on the way: treat like a link we can't vouch for.
@@ -87,7 +94,9 @@ fn kind_name(meta: &fs::Metadata) -> &'static str {
 pub enum Placed {
     Done,
     /// Something other than a symlink is there (a directory, a file, …), left as it was.
-    Blocked { kind: String },
+    Blocked {
+        kind: String,
+    },
 }
 
 /// Points `link` at `target`, in place of the symlink that's there, if any.
@@ -107,9 +116,9 @@ pub fn set_link(link: &Path, target: &Path, privileges: &Privileges) -> Result<(
 pub fn remove_link(link: &Path, privileges: &Privileges) -> Result<()> {
     let context = || format!("can't remove {}", link.display());
     let placed = match take_symlink(link) {
-        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-            privileges.request(&Op::RemoveLink { link: link.to_owned() }, Error::io(context(), &err))?.placed(context)?
-        }
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => privileges
+            .request(&Op::RemoveLink { link: link.to_owned() }, Error::io(context(), &err))?
+            .placed(context)?,
         result => result.map_err(|err| Error::io(context(), &err))?,
     };
     in_place(link, placed)
@@ -142,16 +151,21 @@ pub(crate) fn put_symlink(link: &Path, target: &Path) -> io::Result<Placed> {
                 fs::remove_file(&temp)?;
                 return Ok(Placed::Blocked { kind: kind_name(&old).into() });
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => match renameat2(&temp, link, libc::RENAME_NOREPLACE) {
-                Ok(()) => return Ok(Placed::Done),
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(discard(&temp, err)),
-            },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                match renameat2(&temp, link, libc::RENAME_NOREPLACE) {
+                    Ok(()) => return Ok(Placed::Done),
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => return Err(discard(&temp, err)),
+                }
+            }
             Err(err) if unsupported(&err) => return replace_checked(&temp, link),
             Err(err) => return Err(discard(&temp, err)),
         }
     }
-    Err(discard(&temp, io::Error::other(format!("{} kept changing while the link was set", link.display()))))
+    Err(discard(
+        &temp,
+        io::Error::other(format!("{} kept changing while the link was set", link.display())),
+    ))
 }
 
 /// Where the filesystem can't exchange two names: the same check, right before a plain rename —
@@ -191,7 +205,9 @@ pub(crate) fn take_symlink(link: &Path) -> io::Result<Placed> {
 /// [`take_symlink`] where the filesystem can't rename without replacing: check, then delete.
 fn remove_checked(link: &Path) -> io::Result<Placed> {
     match fs::symlink_metadata(link) {
-        Ok(meta) if !meta.file_type().is_symlink() => Ok(Placed::Blocked { kind: kind_name(&meta).into() }),
+        Ok(meta) if !meta.file_type().is_symlink() => {
+            Ok(Placed::Blocked { kind: kind_name(&meta).into() })
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Placed::Done),
         Err(err) => Err(err),
         Ok(_) => match fs::remove_file(link) {
@@ -204,7 +220,9 @@ fn remove_checked(link: &Path) -> io::Result<Placed> {
 /// The name a link is moved through: `.<name>.devmounts-<pid>`, beside it (so a rename stays on
 /// one filesystem).
 fn aside(link: &Path) -> io::Result<PathBuf> {
-    let name = link.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "link has no name"))?;
+    let name = link
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "link has no name"))?;
     let mut temp = std::ffi::OsString::from(".");
     temp.push(name);
     temp.push(format!(".devmounts-{}", std::process::id()));
@@ -228,7 +246,16 @@ fn renameat2(from: &Path, to: &Path, flags: libc::c_uint) -> io::Result<()> {
     let to = CString::new(to.as_os_str().as_bytes()).map_err(nul)?;
     // SAFETY: both pointers are to NUL-terminated strings that outlive the call, and
     // renameat2 reads nothing else.
-    let rc = unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), flags) };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            flags,
+        )
+    };
     if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
@@ -251,7 +278,8 @@ mod tests {
         assert_eq!(read(&link), target);
         assert_eq!(put_symlink(&link, &other).unwrap(), Placed::Done, "a symlink there");
         assert_eq!(read(&link), other);
-        let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let names: Vec<_> =
+            fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names.len(), 2, "no temporary link left behind: {names:?}");
     }
 
@@ -265,7 +293,11 @@ mod tests {
         fs::write(&file, "kept").unwrap();
         assert_eq!(put_symlink(&dir, &file).unwrap(), Placed::Blocked { kind: "directory".into() });
         assert_eq!(put_symlink(&file, &dir).unwrap(), Placed::Blocked { kind: "file".into() });
-        assert_eq!(fs::read_to_string(dir.join("inside")).unwrap(), "kept", "nothing written inside it either");
+        assert_eq!(
+            fs::read_to_string(dir.join("inside")).unwrap(),
+            "kept",
+            "nothing written inside it either"
+        );
         assert_eq!(fs::read_to_string(&file).unwrap(), "kept");
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2, "no temporary link left behind");
     }
@@ -285,7 +317,11 @@ mod tests {
         assert_eq!(take_symlink(&dir).unwrap(), Placed::Blocked { kind: "directory".into() });
         assert_eq!(take_symlink(&file).unwrap(), Placed::Blocked { kind: "file".into() });
         assert!(dir.is_dir() && fs::read_to_string(&file).unwrap() == "kept");
-        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2, "nothing moved aside and forgotten");
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            2,
+            "nothing moved aside and forgotten"
+        );
     }
 
     #[test]
@@ -300,7 +336,10 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         let temp = aside(&dir).unwrap();
         symlink("/a", &temp).unwrap();
-        assert_eq!(replace_checked(&temp, &dir).unwrap(), Placed::Blocked { kind: "directory".into() });
+        assert_eq!(
+            replace_checked(&temp, &dir).unwrap(),
+            Placed::Blocked { kind: "directory".into() }
+        );
         assert!(dir.is_dir() && fs::symlink_metadata(&temp).is_err());
         assert_eq!(remove_checked(&dir).unwrap(), Placed::Blocked { kind: "directory".into() });
         assert_eq!(remove_checked(&link).unwrap(), Placed::Done);

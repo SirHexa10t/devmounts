@@ -25,10 +25,43 @@ use crate::escalate::Escalation;
 /// Names refused as link names when links are created directly in `/`: the system's directories,
 /// and the links some systems keep there themselves (Debian's `vmlinuz` and `initrd.img`).
 pub const RESERVED_ROOT_NAMES: &[&str] = &[
-    "afs", "bin", "boot", "cdrom", "dev", "efi", "etc", "gnu", "home", "initrd.img", "initrd.img.old",
-    "lib", "lib32", "lib64", "libx32", "lost+found", "media", "mnt", "nix", "opt", "ostree", "proc",
-    "root", "run", "sbin", "selinux", "snap", "srv", "swap", "swapfile", "sys", "sysroot", "tmp",
-    "usr", "var", "vmlinuz", "vmlinuz.old",
+    "afs",
+    "bin",
+    "boot",
+    "cdrom",
+    "dev",
+    "efi",
+    "etc",
+    "gnu",
+    "home",
+    "initrd.img",
+    "initrd.img.old",
+    "lib",
+    "lib32",
+    "lib64",
+    "libx32",
+    "lost+found",
+    "media",
+    "mnt",
+    "nix",
+    "opt",
+    "ostree",
+    "proc",
+    "root",
+    "run",
+    "sbin",
+    "selinux",
+    "snap",
+    "srv",
+    "swap",
+    "swapfile",
+    "sys",
+    "sysroot",
+    "tmp",
+    "usr",
+    "var",
+    "vmlinuz",
+    "vmlinuz.old",
 ];
 
 /// Longest file name Linux accepts (`NAME_MAX`).
@@ -253,7 +286,8 @@ impl FromStr for Config {
     type Err = Error;
 
     fn from_str(text: &str) -> Result<Config> {
-        let raw: RawConfig = toml::from_str(text).map_err(|err| Error::ConfigParse { message: err.to_string() })?;
+        let raw: RawConfig =
+            toml::from_str(text).map_err(|err| Error::ConfigParse { message: err.to_string() })?;
         raw.validate()
     }
 }
@@ -318,7 +352,8 @@ impl RawConfig {
             if !seen_ids.insert(device.id.normalized()) {
                 problems.push(format!("{at}: {} is listed more than once", device.id));
             }
-            let names = std::iter::once(&device.devmount).chain(device.mounts.iter().map(|m| &m.name));
+            let names =
+                std::iter::once(&device.devmount).chain(device.mounts.iter().map(|m| &m.name));
             for name in names {
                 if !seen_names.insert(name.clone()) {
                     problems.push(format!("{at}: the name '{name}' is used more than once"));
@@ -340,11 +375,17 @@ impl RawSettings {
         let defaults = Settings::default();
         let root = self.root.unwrap_or(defaults.root);
         if !is_plain_absolute(&root) {
-            problems.push(format!("settings.root must be an absolute path without '..' (got {})", root.display()));
+            problems.push(format!(
+                "settings.root must be an absolute path without '..' (got {})",
+                root.display()
+            ));
         }
         let mount_base = self.mount_base.unwrap_or(defaults.mount_base);
         if !is_plain_absolute(&mount_base) {
-            problems.push(format!("settings.mount_base must be an absolute path without '..' (got {})", mount_base.display()));
+            problems.push(format!(
+                "settings.mount_base must be an absolute path without '..' (got {})",
+                mount_base.display()
+            ));
         } else if mount_base == Path::new("/") {
             problems.push("settings.mount_base can't be / — what's right below it counts as devmounts' mount points".into());
         }
@@ -402,7 +443,8 @@ impl RawDevice {
 
         let devmount = match self.devmount {
             None => {
-                problems.push(format!("{at}: needs a devmount (the name of the device's root link)"));
+                problems
+                    .push(format!("{at}: needs a devmount (the name of the device's root link)"));
                 String::new()
             }
             Some(name) => {
@@ -425,7 +467,13 @@ impl RawDevice {
             }
         }
 
-        Some(DeviceSpec { id, devmount, mounts, automount: self.automount, mount_options: self.mount_options })
+        Some(DeviceSpec {
+            id,
+            devmount,
+            mounts,
+            automount: self.automount,
+            mount_options: self.mount_options,
+        })
     }
 }
 
@@ -470,7 +518,10 @@ mod tests {
 
     fn assert_problem(text: &str, needle: &str) {
         let problems = problems(text);
-        assert!(problems.iter().any(|p| p.contains(needle)), "no problem containing {needle:?} in {problems:#?}");
+        assert!(
+            problems.iter().any(|p| p.contains(needle)),
+            "no problem containing {needle:?} in {problems:#?}"
+        );
     }
 
     /// A device entry with the given id line and mounts table.
@@ -510,17 +561,34 @@ mod tests {
         let names: Vec<_> = device.mounts.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["music", "movies", "photos"], "file order is kept");
         let root = Path::new("/");
-        assert_eq!(device.link_target(root, &device.mounts[0].path), Path::new("/media_dev/media/music"));
+        assert_eq!(
+            device.link_target(root, &device.mounts[0].path),
+            Path::new("/media_dev/media/music")
+        );
         assert_eq!(device.link_target(root, &DevicePath::root()), Path::new("/media_dev"));
-        assert_eq!(device.link_target(Path::new("/srv/l"), &device.mounts[2].path), Path::new("/srv/l/media_dev/pictures/photos"));
+        assert_eq!(
+            device.link_target(Path::new("/srv/l"), &device.mounts[2].path),
+            Path::new("/srv/l/media_dev/pictures/photos")
+        );
     }
 
     #[test]
     fn the_example_config_parses() {
         let config = parse(include_str!("../example.toml")).unwrap();
-        assert_eq!(config.settings, Settings::default(), "its settings section spells out the defaults");
+        assert_eq!(
+            config.settings,
+            Settings::default(),
+            "its settings section spells out the defaults"
+        );
         let ids: Vec<String> = config.devices.iter().map(|d| d.id.to_string()).collect();
-        assert_eq!(ids, ["UUID=11111111-2222-4333-8444-555555555555", "LABEL=\"STICK\"", "PARTLABEL=\"storage\""]);
+        assert_eq!(
+            ids,
+            [
+                "UUID=11111111-2222-4333-8444-555555555555",
+                "LABEL=\"STICK\"",
+                "PARTLABEL=\"storage\""
+            ]
+        );
         assert!(config.devices[2].mounts.iter().any(|m| m.path.is_root()));
     }
 
@@ -557,7 +625,10 @@ mod tests {
         assert!(!s.automount);
         assert_eq!(s.mount_method, MountMethod::Mount);
         assert_eq!(s.mount_base, Path::new("/mnt/dm"));
-        assert_eq!(s.escalation, Escalation::command(["doas".to_owned(), "-n".to_owned()]).unwrap());
+        assert_eq!(
+            s.escalation,
+            Escalation::command(["doas".to_owned(), "-n".to_owned()]).unwrap()
+        );
 
         let first = &config.devices[0];
         assert!(first.automount(s));
@@ -569,7 +640,9 @@ mod tests {
 
     #[test]
     fn escalate_spellings() {
-        let with = |value: &str| parse(&format!("settings.escalate = {value}\n[[device]]\nlabel='X'\ndevmount='x'"));
+        let with = |value: &str| {
+            parse(&format!("settings.escalate = {value}\n[[device]]\nlabel='X'\ndevmount='x'"))
+        };
         assert_eq!(with("'none'").unwrap().settings.escalation, Escalation::Never);
         assert_eq!(with("'auto'").unwrap().settings.escalation, Escalation::Auto);
         assert_eq!(
@@ -586,12 +659,21 @@ mod tests {
         assert!(matches!(parse("[[device]"), Err(Error::ConfigParse { .. })));
         // Typos are errors rather than silently ignored keys.
         assert!(matches!(parse("[[devices]]\nlabel='X'"), Err(Error::ConfigParse { .. })));
-        assert!(matches!(parse("[[device]]\nlabel='X'\ndevmount='x'\nmount={a='b'}"), Err(Error::ConfigParse { .. })));
+        assert!(matches!(
+            parse("[[device]]\nlabel='X'\ndevmount='x'\nmount={a='b'}"),
+            Err(Error::ConfigParse { .. })
+        ));
         assert!(matches!(parse("[settings]\nrot='/'"), Err(Error::ConfigParse { .. })));
         // A single [device] table instead of an array of them.
-        assert!(matches!(parse("[device]\nlabel='X'\ndevmount='x'"), Err(Error::ConfigParse { .. })));
+        assert!(matches!(
+            parse("[device]\nlabel='X'\ndevmount='x'"),
+            Err(Error::ConfigParse { .. })
+        ));
         // Paths must be strings.
-        assert!(matches!(parse("[[device]]\nlabel='X'\ndevmount='x'\nmounts={a=1}"), Err(Error::ConfigParse { .. })));
+        assert!(matches!(
+            parse("[[device]]\nlabel='X'\ndevmount='x'\nmounts={a=1}"),
+            Err(Error::ConfigParse { .. })
+        ));
         // Multi-line inline tables still need commas.
         assert!(matches!(
             parse("[[device]]\nlabel='X'\ndevmount='x'\nmounts = {\n a = 'b'\n c = 'd'\n}"),
@@ -635,13 +717,22 @@ mod tests {
             "listed more than once",
         );
         // Different kinds of id may name the same device; that can only be detected later.
-        assert!(parse("[[device]]\nuuid='abcd'\ndevmount='a'\n[[device]]\nlabel='abcd'\ndevmount='b'").is_ok());
+        assert!(
+            parse("[[device]]\nuuid='abcd'\ndevmount='a'\n[[device]]\nlabel='abcd'\ndevmount='b'")
+                .is_ok()
+        );
     }
 
     #[test]
     fn names_are_unique_across_devmounts_and_mounts() {
-        assert_problem("[[device]]\nlabel='A'\ndevmount='x'\n[[device]]\nlabel='B'\ndevmount='x'", "used more than once");
-        assert_problem("[[device]]\nlabel='A'\ndevmount='x'\nmounts={x='sub'}", "used more than once");
+        assert_problem(
+            "[[device]]\nlabel='A'\ndevmount='x'\n[[device]]\nlabel='B'\ndevmount='x'",
+            "used more than once",
+        );
+        assert_problem(
+            "[[device]]\nlabel='A'\ndevmount='x'\nmounts={x='sub'}",
+            "used more than once",
+        );
         assert_problem(
             "[[device]]\nlabel='A'\ndevmount='a'\nmounts={m='1'}\n[[device]]\nlabel='B'\ndevmount='b'\nmounts={m='2'}",
             "used more than once",
@@ -665,7 +756,19 @@ mod tests {
         assert!(in_slash("ünï").is_err());
         assert!(in_slash(&"x".repeat(255)).is_ok());
         assert!(in_slash(&"x".repeat(256)).is_err());
-        for reserved in ["bin", "usr", "lib64", "home", "boot", "proc", "selinux", "vmlinuz", "vmlinuz.old", "initrd.img", "initrd.img.old"] {
+        for reserved in [
+            "bin",
+            "usr",
+            "lib64",
+            "home",
+            "boot",
+            "proc",
+            "selinux",
+            "vmlinuz",
+            "vmlinuz.old",
+            "initrd.img",
+            "initrd.img.old",
+        ] {
             assert!(in_slash(reserved).is_err(), "{reserved} should be reserved");
             assert!(validate_link_name(reserved, false).is_ok(), "{reserved} is fine outside /");
         }
@@ -705,28 +808,48 @@ mod tests {
     #[test]
     fn settings_paths_must_be_absolute_and_free_of_dotdot() {
         for bad in ["links", "/tmp/..", "/srv/../etc"] {
-            assert_problem(&format!("settings.root={bad:?}\n{}", dev("label='A'", "")), "settings.root");
-            assert_problem(&format!("settings.mount_base={bad:?}\n{}", dev("label='A'", "")), "settings.mount_base");
+            assert_problem(
+                &format!("settings.root={bad:?}\n{}", dev("label='A'", "")),
+                "settings.root",
+            );
+            assert_problem(
+                &format!("settings.mount_base={bad:?}\n{}", dev("label='A'", "")),
+                "settings.mount_base",
+            );
         }
-        assert!(parse(&format!("settings.root='/srv/./links'\n{}", dev("label='A'", ""))).is_ok(), "'.' changes nothing");
+        assert!(
+            parse(&format!("settings.root='/srv/./links'\n{}", dev("label='A'", ""))).is_ok(),
+            "'.' changes nothing"
+        );
     }
 
     #[test]
     fn the_mount_base_cannot_be_the_root_directory() {
         for root in ["/", "//", "/."] {
-            assert_problem(&format!("settings.mount_base={root:?}\n{}", dev("label='A'", "")), "can't be /");
+            assert_problem(
+                &format!("settings.mount_base={root:?}\n{}", dev("label='A'", "")),
+                "can't be /",
+            );
         }
     }
 
     #[test]
     fn mount_options_are_checked() {
-        assert_problem(&format!("settings.mount_options=['']\n{}", dev("label='A'", "")), "empty option");
-        assert_problem("[[device]]\nlabel='A'\ndevmount='a'\nmount_options=['ro', 'a b']", "whitespace");
+        assert_problem(
+            &format!("settings.mount_options=['']\n{}", dev("label='A'", "")),
+            "empty option",
+        );
+        assert_problem(
+            "[[device]]\nlabel='A'\ndevmount='a'\nmount_options=['ro', 'a b']",
+            "whitespace",
+        );
     }
 
     #[test]
     fn all_problems_are_reported_at_once() {
-        let problems = problems("[[device]]\nlabel='A'\ndevmount='a'\nmounts={'a/b'='x', ok='../y'}\n[[device]]\ndevmount='z'");
+        let problems = problems(
+            "[[device]]\nlabel='A'\ndevmount='a'\nmounts={'a/b'='x', ok='../y'}\n[[device]]\ndevmount='z'",
+        );
         assert_eq!(problems.len(), 3, "{problems:#?}");
     }
 

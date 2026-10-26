@@ -83,7 +83,9 @@ pub fn parse(text: &[u8]) -> Result<Vec<MountEntry>, String> {
         .enumerate()
         .filter(|(_, line)| !line.is_empty())
         .map(|(index, line)| {
-            parse_line(line).ok_or_else(|| format!("malformed line {}: {}", index + 1, String::from_utf8_lossy(line)))
+            parse_line(line).ok_or_else(|| {
+                format!("malformed line {}: {}", index + 1, String::from_utf8_lossy(line))
+            })
         })
         .collect()
 }
@@ -199,10 +201,14 @@ mod tests {
     #[test]
     fn optional_fields_vary() {
         let none = "1 0 8:1 / / rw - ext4 /dev/sda1 rw";
-        let many = "1 0 8:1 / / rw shared:1 master:2 propagate_from:3 unbindable - ext4 /dev/sda1 rw";
+        let many =
+            "1 0 8:1 / / rw shared:1 master:2 propagate_from:3 unbindable - ext4 /dev/sda1 rw";
         for line in [none, many] {
             let entry = &parse(line.as_bytes()).unwrap()[0];
-            assert_eq!((entry.fstype.as_str(), entry.source.as_str(), entry.super_options.as_str()), ("ext4", "/dev/sda1", "rw"));
+            assert_eq!(
+                (entry.fstype.as_str(), entry.source.as_str(), entry.super_options.as_str()),
+                ("ext4", "/dev/sda1", "rw")
+            );
         }
     }
 

@@ -18,7 +18,8 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// One ext4 device labelled X, mounted at `media/X`, containing `docs/`.
+    /// One ext4 device labelled X, containing `docs/`, mounted at `media/X` — `media/` being the
+    /// machine's automounter directory (`DEVMOUNTS_AUTOMOUNT_DIRS`).
     fn new() -> Self {
         let tmp = tmpdir();
         let base = fs::canonicalize(tmp.path()).unwrap();
@@ -27,12 +28,16 @@ impl Fixture {
         fs::write(block.join("uevent"), "DEVNAME=sdb1\n").unwrap();
         fs::write(block.join("partition"), "1\n").unwrap();
         let udev = mkdir(&base, "udev");
-        fs::write(udev.join("b8:17"), "E:ID_FS_TYPE=ext4\nE:ID_FS_UUID=u-1\nE:ID_FS_LABEL=X\n").unwrap();
+        fs::write(udev.join("b8:17"), "E:ID_FS_TYPE=ext4\nE:ID_FS_UUID=u-1\nE:ID_FS_LABEL=X\n")
+            .unwrap();
         let data = mkdir(&base, "media/X");
         mkdir(&data, "docs");
         fs::write(
             base.join("mountinfo"),
-            format!("1 0 0:1 / / rw - rootfs none rw\n30 1 8:17 / {} rw - ext4 /dev/sdb1 rw\n", data.display()),
+            format!(
+                "1 0 0:1 / / rw - rootfs none rw\n30 1 8:17 / {} rw - ext4 /dev/sdb1 rw\n",
+                data.display()
+            ),
         )
         .unwrap();
         let root = mkdir(&base, "links");
@@ -53,6 +58,7 @@ impl Fixture {
             .env("DEVMOUNTS_UDEV_DATA", self.base.join("udev"))
             .env("DEVMOUNTS_MOUNTINFO", self.base.join("mountinfo"))
             .env("DEVMOUNTS_DEV", self.base.join("dev"))
+            .env("DEVMOUNTS_AUTOMOUNT_DIRS", self.base.join("media"))
             .env("NO_COLOR", "1")
             .output()
             .unwrap()
@@ -77,6 +83,7 @@ impl Fixture {
             .env("DEVMOUNTS_UDEV_DATA", self.base.join("udev"))
             .env("DEVMOUNTS_MOUNTINFO", self.base.join("mountinfo"))
             .env("DEVMOUNTS_DEV", self.base.join("dev"))
+            .env("DEVMOUNTS_AUTOMOUNT_DIRS", self.base.join("media"))
             .env("DEVMOUNTS_TEST_LOG", self.command_log())
             .env("NO_COLOR", "1")
             .output()
@@ -86,6 +93,14 @@ impl Fixture {
     /// The commands [`fake_commands`] were run with, one per line.
     fn command_log(&self) -> PathBuf {
         self.base.join("commands.log")
+    }
+
+    fn commands_run(&self) -> Vec<String> {
+        fs::read_to_string(self.command_log())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 }
 
@@ -104,10 +119,15 @@ fn no_arguments_prints_help() {
     let f = Fixture::new();
     let out = f.run_plain(&[]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains("Usage:"), "help for a missing CONFIG is a usage error: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Usage:"),
+        "help for a missing CONFIG is a usage error: {}",
+        stderr(&out)
+    );
 }
 
-/// Each usage mistake says what's wrong, not just that something is.
+/// Each usage mistake says what's wrong, not just that something is — and says it as an `error:`,
+/// the way clap words its own, whichever of the two caught it.
 #[test]
 fn usage_mistakes_are_explained() {
     let f = Fixture::new();
@@ -115,6 +135,7 @@ fn usage_mistakes_are_explained() {
     let config = config.to_str().unwrap();
     for (argv, explained) in [
         (&["status"][..], "<CONFIG>"),
+        (&["--json"], "no CONFIG given"),
         (&["--json", "status", config], "go after the subcommand"),
         (&[config, "--root", "relative"], "absolute path without '..'"),
         (&[config, "--escalate", ""], "is empty"),
@@ -122,6 +143,7 @@ fn usage_mistakes_are_explained() {
         let out = f.run_plain(argv);
         assert_eq!(out.status.code(), Some(2), "{argv:?}");
         assert!(stderr(&out).contains(explained), "{argv:?}: {}", stderr(&out));
+        assert!(stderr(&out).starts_with("error: "), "{argv:?}: {}", stderr(&out));
     }
 }
 
@@ -130,13 +152,13 @@ fn config_errors_exit_with_2() {
     let f = Fixture::new();
     let out = f.run_plain(&[f.base.join("missing.toml").to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains("can't read config file"), "{}", stderr(&out));
+    assert!(stderr(&out).starts_with("error: can't read config file"), "{}", stderr(&out));
 
     let bad = f.config("[[device]]\ndevmount = 'x'\nmounts = { 'a/b' = 'x' }\n");
     let out = f.run_plain(&["status", bad.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(2));
     let err = stderr(&out);
-    assert!(err.contains("needs one of uuid"), "{err}");
+    assert!(err.starts_with("error: invalid config") && err.contains("needs one of uuid"), "{err}");
 
     let out = f.run_plain(&[f.config(CONFIG).to_str().unwrap(), "--root", "relative"]);
     assert_eq!(out.status.code(), Some(2));
@@ -227,7 +249,11 @@ fn fake_commands(f: &Fixture) -> PathBuf {
     let bin = mkdir(&f.base, "bin");
     let script = |name: &str, body: &str| {
         let path = bin.join(name);
-        fs::write(&path, format!("#!/bin/sh\necho \"{name} $*\" >> \"$DEVMOUNTS_TEST_LOG\"\n{body}")).unwrap();
+        fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"{name} $*\" >> \"$DEVMOUNTS_TEST_LOG\"\n{body}"),
+        )
+        .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     };
     script(
@@ -267,7 +293,9 @@ fn an_internal_drive_is_mounted_through_one_privileged_helper_per_run() {
     let config = f.config(&format!("settings.mount_base = {mnt:?}\n{CONFIG}"));
     let (config, root) = (config.to_str().unwrap(), f.root.to_str().unwrap());
     let sudo = bin.join("sudo");
-    let run = |args: &[&str]| f.run_with(&bin, &[args, &["--root", root, "--escalate", sudo.to_str().unwrap()]].concat());
+    let run = |args: &[&str]| {
+        f.run_with(&bin, &[args, &["--root", root, "--escalate", sudo.to_str().unwrap()]].concat())
+    };
 
     let applied = run(&["apply", config]);
     assert_eq!(applied.status.code(), Some(0), "{}{}", stdout(&applied), stderr(&applied));
@@ -275,13 +303,16 @@ fn an_internal_drive_is_mounted_through_one_privileged_helper_per_run() {
     assert_eq!(fs::read_link(f.root.join("x")).unwrap(), mnt.join("u-1"));
     let removed = run(&["remove", "--unmount", config]);
     assert_eq!(removed.status.code(), Some(0), "{}{}", stdout(&removed), stderr(&removed));
-    assert!(stdout(&removed).contains(&format!("unmounted {}", mnt.join("u-1").display())), "{}", stdout(&removed));
+    assert!(
+        stdout(&removed).contains(&format!("unmounted {}", mnt.join("u-1").display())),
+        "{}",
+        stdout(&removed)
+    );
 
     let devnode = f.base.join("dev/sdb1");
     let helper = format!("sudo {} --devmounts-privileged-helper", env!("CARGO_BIN_EXE_devmounts"));
-    let commands = fs::read_to_string(f.command_log()).unwrap();
     assert_eq!(
-        commands.lines().collect::<Vec<_>>(),
+        f.commands_run(),
         [
             "udisksctl status".to_owned(),
             format!("udisksctl mount --block-device {} --no-user-interaction", devnode.display()),
@@ -305,7 +336,17 @@ fn a_drive_neither_way_can_mount_says_why_for_both() {
     let bin = fake_commands(&f);
     let mnt = mkdir(&f.base, "mnt");
     let config = f.config(&format!("settings.mount_base = {mnt:?}\n{CONFIG}"));
-    let out = f.run_with(&bin, &["apply", config.to_str().unwrap(), "--root", f.root.to_str().unwrap(), "--escalate", "none"]);
+    let out = f.run_with(
+        &bin,
+        &[
+            "apply",
+            config.to_str().unwrap(),
+            "--root",
+            f.root.to_str().unwrap(),
+            "--escalate",
+            "none",
+        ],
+    );
     assert_eq!(out.status.code(), Some(1), "{}{}", stdout(&out), stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("udisks2 wants an administrator's password for it, and mounting it with `mount` instead failed"), "{text}");
@@ -313,7 +354,70 @@ fn a_drive_neither_way_can_mount_says_why_for_both() {
     assert!(!mnt.join("u-1").exists(), "the mount point made for it is removed again");
     let devnode = f.base.join("dev/sdb1");
     assert_eq!(
-        fs::read_to_string(f.command_log()).unwrap().lines().collect::<Vec<_>>(),
-        ["udisksctl status".to_owned(), format!("udisksctl mount --block-device {} --no-user-interaction", devnode.display())]
+        f.commands_run(),
+        [
+            "udisksctl status".to_owned(),
+            format!("udisksctl mount --block-device {} --no-user-interaction", devnode.display())
+        ]
+    );
+}
+
+/// `auto` takes an automounter's mount down through udisks2 without letting it prompt, and where
+/// udisks2 wants a password, with `umount` through the run's helper instead.
+#[test]
+fn auto_unmounts_with_umount_where_udisks2_wants_a_password() {
+    if devmounts::escalate::is_root() {
+        return; // root unmounts directly: no udisks2, no helper
+    }
+    let f = Fixture::new();
+    let bin = fake_commands(&f);
+    let config = f.config(CONFIG);
+    let sudo = bin.join("sudo");
+    let args =
+        ["remove", "--unmount", config.to_str().unwrap(), "--root", f.root.to_str().unwrap()];
+
+    // With no way to root, the error says what both attempts met.
+    let out = f.run_with(&bin, &[&args[..], &["--escalate", "none"]].concat());
+    assert_eq!(out.status.code(), Some(1), "{}{}", stdout(&out), stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("udisks2 wants an administrator's password for it, and unmounting it with `umount` instead failed"), "{text}");
+    assert!(text.contains("needs root, and privilege escalation is off"), "{text}");
+    fs::remove_file(f.command_log()).unwrap();
+
+    let out = f.run_with(&bin, &[&args[..], &["--escalate", sudo.to_str().unwrap()]].concat());
+    assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains(&format!("unmounted {}", f.data.display())), "{}", stdout(&out));
+    let devnode = f.base.join("dev/sdb1");
+    assert_eq!(
+        f.commands_run(),
+        [
+            "udisksctl status".to_owned(),
+            format!("udisksctl unmount --block-device {} --no-user-interaction", devnode.display()),
+            format!("sudo {} --devmounts-privileged-helper", env!("CARGO_BIN_EXE_devmounts")),
+            format!("umount -- {}", f.data.display()),
+        ]
+    );
+}
+
+/// With `mount_method = "udisks"`, an automounter's mount comes down through udisks2 alone, as it
+/// would go up: its own prompt allowed (no `--no-user-interaction`), and nothing else tried when it
+/// refuses — no helper, no `umount`.
+#[test]
+fn with_the_udisks_method_an_automounters_mount_comes_down_through_udisks2_alone() {
+    let f = Fixture::new();
+    let bin = fake_commands(&f);
+    let config = f.config(&format!("settings.mount_method = 'udisks'\n{CONFIG}"));
+    let sudo = bin.join("sudo");
+    let args =
+        ["remove", "--unmount", config.to_str().unwrap(), "--root", f.root.to_str().unwrap()];
+    let out = f.run_with(&bin, &[&args[..], &["--escalate", sudo.to_str().unwrap()]].concat());
+    assert_eq!(out.status.code(), Some(1), "{}{}", stdout(&out), stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains(&format!("✗ unmounting {} failed", f.data.display())), "{text}");
+    assert!(text.contains("NotAuthorized"), "udisks2's own refusal is what's reported: {text}");
+    let devnode = f.base.join("dev/sdb1");
+    assert_eq!(
+        f.commands_run(),
+        [format!("udisksctl unmount --block-device {}", devnode.display())]
     );
 }

@@ -3,12 +3,13 @@
 //! command the first time a step needs it and kept for the rest of the run. However many steps a
 //! run takes, it asks for a password at most once.
 //!
-//! The helper is this same program, started again as `<escalation> <program> --devmounts-privileged-helper`
-//! and claimed by [`try_serve`] before anything else runs. It reads one [`Op`] per line on stdin
-//! and answers each with a [`Reply`] line on stdout, doing the work with the very functions a
-//! direct change uses — a link is replaced atomically, and only in place of a symlink, either way.
-//! A program embedding devmounts calls [`try_serve`] first thing in `main`, or names a program that
-//! does in [`Options::helper`](crate::Options::helper).
+//! The helper is this same program, started again as
+//! `<escalation> <program> --devmounts-privileged-helper` ([`helper_argv`]) and claimed by
+//! [`try_serve`] before anything else runs. It reads one [`Op`] per line on stdin and answers each
+//! with a [`Reply`] line on stdout, doing the work with the very functions a direct change uses —
+//! a link is replaced atomically, and only in place of a symlink, either way. A program embedding
+//! devmounts calls [`try_serve`] first thing in `main`, or names a program that does in
+//! [`Options::helper`](crate::Options::helper).
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
@@ -73,9 +74,14 @@ pub enum Op {
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum Reply {
     Done,
-    /// Something other than a symlink is at the link's path (a directory, a file, …), left as it was.
-    Blocked { kind: String },
-    Failed { message: String },
+    /// Something other than a symlink is at the link's path (a directory, a file, …), left as it
+    /// was.
+    Blocked {
+        kind: String,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 impl Op {
@@ -86,7 +92,9 @@ impl Op {
             Op::RemoveLink { link } => link::take_symlink(link).map(Reply::from),
             Op::CreateDir { dir } => fs::create_dir_all(dir).map(|()| Reply::Done),
             Op::RemoveDir { dir } => fs::remove_dir(dir).map(|()| Reply::Done),
-            Op::Mount { options, device, dir } => return run(&mount::mount_argv(device, dir, options)),
+            Op::Mount { options, device, dir } => {
+                return run(&mount::mount_argv(device, dir, options));
+            }
             Op::Unmount { mount_point } => return run(&mount::umount_argv(mount_point)),
         };
         outcome.unwrap_or_else(|err| Reply::Failed { message: err.to_string() })
@@ -184,12 +192,11 @@ impl Session {
     fn start(prefix: &[String], helper: Option<&Path>) -> std::result::Result<Session, String> {
         let program = match helper {
             Some(program) => program.to_owned(),
-            None => std::env::current_exe()
-                .map_err(|err| format!("can't find this program to run as its privileged helper: {err}"))?,
+            None => std::env::current_exe().map_err(|err| {
+                format!("can't find this program to run as its privileged helper: {err}")
+            })?,
         };
-        let mut argv: Vec<OsString> = prefix.iter().map(OsString::from).collect();
-        argv.push(program.into_os_string());
-        argv.push(HELPER_MARKER.into());
+        let argv = helper_argv(prefix, &program);
         let command = escalate::display_command(&argv);
         // stderr is the terminal's: the password prompt, and why a refused one was refused.
         let mut child = Command::new(&argv[0])
@@ -200,20 +207,25 @@ impl Session {
             .spawn()
             .map_err(|err| format!("can't run `{command}`: {err}"))?;
         let to_helper = child.stdin.take();
-        let from_helper = BufReader::new(child.stdout.take().expect("the helper's stdout is piped"));
+        let from_helper =
+            BufReader::new(child.stdout.take().expect("the helper's stdout is piped"));
         Ok(Session { command, child, to_helper, from_helper })
     }
 
     fn ask(&mut self, op: &Op) -> std::result::Result<Reply, String> {
-        let ended = format!("`{}` ended without answering (any reason it gave is above)", self.command);
+        let ended =
+            format!("`{}` ended without answering (any reason it gave is above)", self.command);
         let to_helper = self.to_helper.as_mut().ok_or_else(|| ended.clone())?;
         let request = serde_json::to_string(op).expect("steps serialize");
-        writeln!(to_helper, "{request}").and_then(|()| to_helper.flush()).map_err(|_| ended.clone())?;
+        writeln!(to_helper, "{request}")
+            .and_then(|()| to_helper.flush())
+            .map_err(|_| ended.clone())?;
         let mut line = String::new();
         match self.from_helper.read_line(&mut line) {
             Ok(0) | Err(_) => Err(ended),
-            Ok(_) => serde_json::from_str(line.trim())
-                .map_err(|err| format!("`{}` answered {:?}, which isn't a reply: {err}", self.command, line.trim())),
+            Ok(_) => serde_json::from_str(line.trim()).map_err(|err| {
+                format!("`{}` answered {:?}, which isn't a reply: {err}", self.command, line.trim())
+            }),
         }
     }
 }
@@ -224,6 +236,14 @@ impl Drop for Session {
         drop(self.to_helper.take());
         let _ = self.child.wait();
     }
+}
+
+/// The command line the helper is started with: the escalation's own words, then `program` and
+/// [`HELPER_MARKER`].
+pub fn helper_argv(prefix: &[String], program: &Path) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = prefix.iter().map(OsString::from).collect();
+    argv.extend([program.as_os_str().to_owned(), HELPER_MARKER.into()]);
+    argv
 }
 
 /// Serves as the privileged helper, and then returns `true`, when this process was started as one
@@ -288,7 +308,11 @@ mod tests {
             assert!(!line.contains('\n'), "one step, one line: {line}");
             assert_eq!(serde_json::from_str::<Op>(&line).unwrap(), op);
         }
-        for reply in [Reply::Done, Reply::Blocked { kind: "directory".into() }, Reply::Failed { message: "no\nway".into() }] {
+        for reply in [
+            Reply::Done,
+            Reply::Blocked { kind: "directory".into() },
+            Reply::Failed { message: "no\nway".into() },
+        ] {
             let line = serde_json::to_string(&reply).unwrap();
             assert!(!line.contains('\n'), "{line}");
             assert_eq!(serde_json::from_str::<Reply>(&line).unwrap(), reply);
@@ -302,28 +326,55 @@ mod tests {
         let link = tmp.path().join("x");
         let lines = [
             serde_json::to_string(&Op::CreateDir { dir: dir.clone() }).unwrap(),
-            serde_json::to_string(&Op::SetLink { link: link.clone(), target: dir.clone() }).unwrap(),
+            serde_json::to_string(&Op::SetLink { link: link.clone(), target: dir.clone() })
+                .unwrap(),
             "garbage".to_owned(),
-            serde_json::to_string(&Op::SetLink { link: tmp.path().join("mnt"), target: dir.clone() }).unwrap(),
+            serde_json::to_string(&Op::SetLink {
+                link: tmp.path().join("mnt"),
+                target: dir.clone(),
+            })
+            .unwrap(),
             serde_json::to_string(&Op::RemoveLink { link: link.clone() }).unwrap(),
         ];
         let mut output = Vec::new();
         serve(io::Cursor::new(lines.join("\n")), &mut output).unwrap();
-        let replies: Vec<Reply> =
-            String::from_utf8(output).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let replies: Vec<Reply> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(replies.len(), 5);
         assert_eq!(replies[0], Reply::Done);
         assert_eq!(replies[1], Reply::Done);
-        assert!(matches!(&replies[2], Reply::Failed { message } if message.starts_with("not a step")));
-        assert_eq!(replies[3], Reply::Blocked { kind: "directory".into() }, "a directory is never replaced");
+        assert!(
+            matches!(&replies[2], Reply::Failed { message } if message.starts_with("not a step"))
+        );
+        assert_eq!(
+            replies[3],
+            Reply::Blocked { kind: "directory".into() },
+            "a directory is never replaced"
+        );
         assert_eq!(replies[4], Reply::Done);
         assert!(dir.is_dir() && !link.exists());
+    }
+
+    /// The helper's command line is shown — in every message about it — exactly as it is run.
+    #[test]
+    fn the_helper_is_started_and_shown_as_one_command_line() {
+        let argv = helper_argv(&["doas".into(), "-n".into()], Path::new("/opt/my tools/devmounts"));
+        let words: Vec<&OsStr> = argv.iter().map(OsString::as_os_str).collect();
+        assert_eq!(words, ["doas", "-n", "/opt/my tools/devmounts", HELPER_MARKER]);
+        assert_eq!(
+            escalate::display_command(&argv),
+            "doas -n '/opt/my tools/devmounts' --devmounts-privileged-helper"
+        );
     }
 
     #[test]
     fn without_a_way_to_escalate_the_step_keeps_its_own_error() {
         let privileges = Privileges::new(Escalation::Never, None);
-        let denied = Error::Io { context: "can't create /x".into(), message: "Permission denied".into() };
+        let denied =
+            Error::Io { context: "can't create /x".into(), message: "Permission denied".into() };
         let result = privileges.request(&Op::RemoveLink { link: "/x".into() }, denied.clone());
         assert_eq!(result.unwrap_err(), denied);
     }

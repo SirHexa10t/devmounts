@@ -27,7 +27,9 @@ above` — and `--json` prints a machine-readable report instead.
 
 Exit codes: 0 no problems, 1 the run went through with problems (the report says which),
 2 it couldn't run at all — a bad config or command line, or a machine whose devices or
-mount table couldn't be read.
+mount table couldn't be read before anything was done. Whatever goes wrong partway through
+a run — a mount, an unmount, the mount table itself — is the problem of the device it
+happened to, and the report keeps everything done before it.
 
 `remove` takes a device's links down even while the device isn't connected; the report
 says so (`"not_connected": true` in JSON), and it doesn't count as a problem.
@@ -93,13 +95,16 @@ covers them.
   asks twice. Without udisks2, or as root, `auto` is `mount`.
 - `"mount"`: `mount` into `<mount_base>/<uuid>` (`mount_base` is `/run/devmounts` by
   default), a directory made for it and removed again when it's unmounted.
-- `"udisks"`: udisks2 only, its own password prompt included.
+- `"udisks"`: udisks2 only, for unmounting too, its own password prompt included.
 - If a device is mounted only in parts (e.g. btrfs subvolumes, like a system disk), its
   top level is mounted into `mount_base` (`subvolid=5`) for the devmount.
 - `remove --unmount` unmounts the device where it's mounted inside `/run/media` or
   `/media` (an automounter's mounts) or at the `<mount_base>/<uuid>` devmounts makes. Any
   other mount (fstab's, the system's) is left alone, and the report lists it as left
-  mounted. For that reason `mount_base` can't be `/`.
+  mounted. For that reason `mount_base` can't be `/`. An automounter's mount comes down
+  the way `auto` mounts (udisks2, or `umount` through the helper where udisks2 wants a
+  password), devmounts' own with `umount`; each unmount is reported on its own, and one
+  failing doesn't stop the others.
 - Containers (LUKS, RAID members, single-LV LVM) are followed to the filesystem on top;
   locked ones are reported with a hint (`udisksctl unlock -b …`).
 
@@ -138,7 +143,10 @@ calls `devmounts::privileged::try_serve()` first thing in `main` and exits if it
 The command line is part of the library too, as `devmounts::cli` (the default `cli`
 feature). Each subcommand's arguments are a clap `Args` struct (`RunArgs`, `RemoveArgs`,
 `DevicesArgs`), so another program can offer a subcommand as a command of its own;
-`cli::Command::run` carries it out and returns the exit status.
+`cli::Command::run` carries it out and returns the exit status. `RunArgs::config` is
+required on devmounts' own command line, yet an `Option`: a program with a default config
+of its own relaxes the requirement and fills it in. Left `None`, the run says the CONFIG
+is missing.
 
 Machine access goes through the `System` trait, so the logic runs against fakes in tests.
 Build with `default-features = false` to leave out the CLI (and clap).
@@ -148,8 +156,9 @@ Build with `default-features = false` to leave out the CLI (and clap).
 `cargo test` runs everything that doesn't need hardware: fake devices, fixture
 sysfs/udev/mountinfo trees, real links in temporary directories, and the binary itself.
 The binary reads the machine from `DEVMOUNTS_SYSFS`, `DEVMOUNTS_UDEV_DATA`,
-`DEVMOUNTS_MOUNTINFO` and `DEVMOUNTS_DEV` when they're set. One test runs it against
-stand-in `udisksctl`, `sudo`, `mount` and `umount` commands and checks exactly what it
+`DEVMOUNTS_MOUNTINFO` and `DEVMOUNTS_DEV` when they're set, and its automounters'
+directories from `DEVMOUNTS_AUTOMOUNT_DIRS` (`:`-separated). Some tests run it against
+stand-in `udisksctl`, `sudo`, `mount` and `umount` commands and check exactly what it
 runs. `cargo test --no-default-features` tests the library without the CLI.
 
 The real-device round trip is opt-in. It mounts read-only if needed, and restores the

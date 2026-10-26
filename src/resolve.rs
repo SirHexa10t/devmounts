@@ -14,7 +14,8 @@ use crate::mountinfo::{DevNum, MountEntry};
 use crate::system::BlockDevice;
 
 /// Types whose contents only become mountable through a device stacked on top.
-const CONTAINERS: &[&str] = &["crypto_LUKS", "BitLocker", "linux_raid_member", "LVM2_member", "bcache"];
+const CONTAINERS: &[&str] =
+    &["crypto_LUKS", "BitLocker", "linux_raid_member", "LVM2_member", "bcache"];
 
 /// Recognized but not mountable as a filesystem.
 const NOT_FILESYSTEMS: &[&str] = &["swap", "zfs_member", "ceph", "drbd", "VMFS_volume_member"];
@@ -34,7 +35,9 @@ pub struct ResolvedDevice {
 }
 
 pub fn id_matches(id: &DeviceId, device: &BlockDevice) -> bool {
-    let eq_ci = |value: &Option<String>, wanted: &str| value.as_deref().is_some_and(|v| v.eq_ignore_ascii_case(wanted));
+    let eq_ci = |value: &Option<String>, wanted: &str| {
+        value.as_deref().is_some_and(|v| v.eq_ignore_ascii_case(wanted))
+    };
     match id {
         DeviceId::Uuid(uuid) => eq_ci(&device.uuid, uuid),
         DeviceId::PartUuid(uuid) => eq_ci(&device.partuuid, uuid),
@@ -45,7 +48,8 @@ pub fn id_matches(id: &DeviceId, device: &BlockDevice) -> bool {
 
 /// Finds the device an id refers to and the filesystem on it.
 pub fn find_device(id: &DeviceId, devices: &[BlockDevice]) -> Result<ResolvedDevice> {
-    let by_kname: HashMap<&str, &BlockDevice> = devices.iter().map(|d| (d.kname.as_str(), d)).collect();
+    let by_kname: HashMap<&str, &BlockDevice> =
+        devices.iter().map(|d| (d.kname.as_str(), d)).collect();
     let mut candidates: Vec<&BlockDevice> = devices.iter().filter(|d| id_matches(id, d)).collect();
 
     if candidates.is_empty() {
@@ -57,7 +61,11 @@ pub fn find_device(id: &DeviceId, devices: &[BlockDevice]) -> Result<ResolvedDev
     let kept: Vec<&BlockDevice> = candidates
         .iter()
         .copied()
-        .filter(|c| !candidates.iter().any(|other| other.kname != c.kname && stacked_on(other, c, &by_kname)))
+        .filter(|c| {
+            !candidates
+                .iter()
+                .any(|other| other.kname != c.kname && stacked_on(other, c, &by_kname))
+        })
         .collect();
     candidates = kept;
 
@@ -65,7 +73,11 @@ pub fn find_device(id: &DeviceId, devices: &[BlockDevice]) -> Result<ResolvedDev
         [one] => *one,
         [first, rest @ ..] if is_one_btrfs(first, rest) => {
             let members: Vec<BlockDevice> = candidates.iter().map(|d| (*d).clone()).collect();
-            return Ok(ResolvedDevice { device: (*first).clone(), members, containers: Vec::new() });
+            return Ok(ResolvedDevice {
+                device: (*first).clone(),
+                members,
+                containers: Vec::new(),
+            });
         }
         many => {
             return Err(Error::AmbiguousDevice {
@@ -81,7 +93,11 @@ pub fn find_device(id: &DeviceId, devices: &[BlockDevice]) -> Result<ResolvedDev
 }
 
 /// Whether `upper` is built on top of `lower`, directly or through other layers.
-fn stacked_on(upper: &BlockDevice, lower: &BlockDevice, by_kname: &HashMap<&str, &BlockDevice>) -> bool {
+fn stacked_on(
+    upper: &BlockDevice,
+    lower: &BlockDevice,
+    by_kname: &HashMap<&str, &BlockDevice>,
+) -> bool {
     let mut pending: Vec<&str> = lower.holders.iter().map(String::as_str).collect();
     let mut seen = HashSet::new();
     while let Some(kname) = pending.pop() {
@@ -100,7 +116,11 @@ fn stacked_on(upper: &BlockDevice, lower: &BlockDevice, by_kname: &HashMap<&str,
 fn is_one_btrfs(first: &BlockDevice, rest: &[&BlockDevice]) -> bool {
     first.fstype.as_deref() == Some("btrfs")
         && first.uuid.is_some()
-        && rest.iter().all(|d| d.fstype == first.fstype && d.uuid.as_deref().map(str::to_ascii_lowercase) == first.uuid.as_deref().map(str::to_ascii_lowercase))
+        && rest.iter().all(|d| {
+            d.fstype == first.fstype
+                && d.uuid.as_deref().map(str::to_ascii_lowercase)
+                    == first.uuid.as_deref().map(str::to_ascii_lowercase)
+        })
 }
 
 fn unwrap_containers(
@@ -169,7 +189,8 @@ fn near_misses(id: &DeviceId, devices: &[BlockDevice]) -> Option<String> {
         .filter(|v| v.eq_ignore_ascii_case(wanted) || v.trim() == wanted.trim())
         .map(|v| format!("{v:?}"))
         .collect();
-    (!similar.is_empty()).then(|| format!("labels are case-sensitive; found {}", similar.join(", ")))
+    (!similar.is_empty())
+        .then(|| format!("labels are case-sensitive; found {}", similar.join(", ")))
 }
 
 /// The mount tree, for working out which mount a path lookup really ends in.
@@ -190,7 +211,9 @@ impl<'a> MountTree<'a> {
         }
         let at_slash = || entries.iter().filter(|e| e.mount_point == Path::new("/"));
         // The namespace root is the "/" mount whose parent isn't in the table.
-        let root = at_slash().find(|e| !ids.contains(&e.parent_id) || e.parent_id == e.id).or_else(|| at_slash().next());
+        let root = at_slash()
+            .find(|e| !ids.contains(&e.parent_id) || e.parent_id == e.id)
+            .or_else(|| at_slash().next());
         let mut tree = MountTree { entries, children, root: None };
         tree.root = root.map(|r| tree.topmost(r));
         tree
@@ -257,7 +280,9 @@ pub fn device_mounts<'a>(
             // The node can't be inspected (e.g. no /dev in a test or container): compare names.
             None => device.members.iter().any(|m| {
                 source == m.devnode
-                    || m.dm_name.as_ref().is_some_and(|n| source == Path::new("/dev/mapper").join(n))
+                    || m.dm_name
+                        .as_ref()
+                        .is_some_and(|n| source == Path::new("/dev/mapper").join(n))
             }),
         }
     };
@@ -265,7 +290,9 @@ pub fn device_mounts<'a>(
     let matched: Vec<&MountEntry> = tree
         .entries()
         .iter()
-        .filter(|e| (!e.devnum.is_anonymous() && numbers.contains(&e.devnum)) || source_is_member(&e.source))
+        .filter(|e| {
+            (!e.devnum.is_anonymous() && numbers.contains(&e.devnum)) || source_is_member(&e.source)
+        })
         .collect();
     // Every mount of the same superblock (same anonymous number) is the same filesystem.
     let superblocks: HashSet<DevNum> = matched.iter().map(|e| e.devnum).collect();
@@ -291,9 +318,15 @@ pub fn locate<'a>(path: &DevicePath, mounts: &[&'a MountEntry]) -> Option<Locati
     mounts
         .iter()
         .filter_map(|m| Some((*m, wanted.strip_prefix(&m.root).ok()?)))
-        .min_by_key(|(m, _)| (Reverse(m.root.components().count()), m.mount_point.components().count(), m.id))
+        .min_by_key(|(m, _)| {
+            (Reverse(m.root.components().count()), m.mount_point.components().count(), m.id)
+        })
         .map(|(mount, rest)| {
-            let path = if rest.as_os_str().is_empty() { mount.mount_point.clone() } else { mount.mount_point.join(rest) };
+            let path = if rest.as_os_str().is_empty() {
+                mount.mount_point.clone()
+            } else {
+                mount.mount_point.join(rest)
+            };
             Location { mount, path }
         })
 }
@@ -306,19 +339,29 @@ pub fn exposed_parts(mounts: &[&MountEntry]) -> Vec<String> {
 /// Checks a target on the real filesystem: it must be an existing directory, and after
 /// resolving symlinks it must still be on one of the device's mounts (not led elsewhere by
 /// a symlink inside the device, nor covered by another mount). Returns the resolved path.
-pub fn check_target(target: &Path, device_mounts: &[&MountEntry], tree: &MountTree<'_>) -> Result<PathBuf> {
+pub fn check_target(
+    target: &Path,
+    device_mounts: &[&MountEntry],
+    tree: &MountTree<'_>,
+) -> Result<PathBuf> {
     let meta = fs::metadata(target).map_err(|err| match err.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => Error::TargetMissing { target: target.to_owned() },
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => {
+            Error::TargetMissing { target: target.to_owned() }
+        }
         _ => Error::io(format!("can't inspect {}", target.display()), &err),
     })?;
     if !meta.is_dir() {
         return Err(Error::TargetNotDirectory { target: target.to_owned() });
     }
-    let resolved = fs::canonicalize(target).map_err(|err| Error::io(format!("can't resolve {}", target.display()), &err))?;
+    let resolved = fs::canonicalize(target)
+        .map_err(|err| Error::io(format!("can't resolve {}", target.display()), &err))?;
     let ours: HashSet<u32> = device_mounts.iter().map(|m| m.id).collect();
     match tree.mount_at(&resolved) {
         Some(m) if ours.contains(&m.id) => Ok(resolved),
-        Some(m) if resolved == target => Err(Error::TargetCovered { target: target.to_owned(), mount_point: m.mount_point.clone() }),
+        Some(m) if resolved == target => Err(Error::TargetCovered {
+            target: target.to_owned(),
+            mount_point: m.mount_point.clone(),
+        }),
         _ => Err(Error::TargetEscapesDevice { target: target.to_owned(), resolved }),
     }
 }
@@ -348,7 +391,15 @@ mod tests {
         d
     }
 
-    fn mount(id: u32, parent: u32, devnum: (u32, u32), root: &str, at: &str, fstype: &str, source: &str) -> MountEntry {
+    fn mount(
+        id: u32,
+        parent: u32,
+        devnum: (u32, u32),
+        root: &str,
+        at: &str,
+        fstype: &str,
+        source: &str,
+    ) -> MountEntry {
         MountEntry {
             id,
             parent_id: parent,
@@ -392,7 +443,9 @@ mod tests {
     fn labels_are_case_sensitive_with_a_hint() {
         let devices = vec![fs(dev("sdb1", 8, 17), "vfat", "1234-ABCD", Some("BACKUP"))];
         match find_device(&label("backup"), &devices) {
-            Err(Error::DeviceNotFound { hint: Some(hint), .. }) => assert!(hint.contains("\"BACKUP\""), "{hint}"),
+            Err(Error::DeviceNotFound { hint: Some(hint), .. }) => {
+                assert!(hint.contains("\"BACKUP\""), "{hint}")
+            }
             other => panic!("unexpected {other:?}"),
         }
         assert!(matches!(
@@ -444,7 +497,10 @@ mod tests {
             held_by(fs(dev("sdc1", 8, 33), "xfs", "u", None), &["dm-2"]),
             fs(dev("dm-2", 254, 2), "xfs", "u", None),
         ];
-        assert_eq!(find_device(&DeviceId::Uuid("u".into()), &devices).unwrap().device.kname, "dm-2");
+        assert_eq!(
+            find_device(&DeviceId::Uuid("u".into()), &devices).unwrap().device.kname,
+            "dm-2"
+        );
     }
 
     #[test]
@@ -459,7 +515,8 @@ mod tests {
     fn open_luks_is_followed_to_the_filesystem() {
         let mut inner = fs(dev("dm-0", 254, 0), "ext4", "inner", Some("secret"));
         inner.dm_name = Some("luks-outer".into());
-        let devices = vec![held_by(fs(dev("sdb1", 8, 17), "crypto_LUKS", "outer", None), &["dm-0"]), inner];
+        let devices =
+            vec![held_by(fs(dev("sdb1", 8, 17), "crypto_LUKS", "outer", None), &["dm-0"]), inner];
         let found = find_device(&DeviceId::Uuid("outer".into()), &devices).unwrap();
         assert_eq!(found.device.kname, "dm-0");
         assert_eq!(found.containers.len(), 1);
@@ -472,7 +529,9 @@ mod tests {
     fn locked_luks_explains_itself() {
         let devices = vec![fs(dev("sdb1", 8, 17), "crypto_LUKS", "outer", None)];
         match find_device(&DeviceId::Uuid("outer".into()), &devices) {
-            Err(Error::InactiveContainer { hint, .. }) => assert!(hint.contains("udisksctl unlock -b /dev/sdb1")),
+            Err(Error::InactiveContainer { hint, .. }) => {
+                assert!(hint.contains("udisksctl unlock -b /dev/sdb1"))
+            }
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -486,7 +545,10 @@ mod tests {
         ];
         let found = find_device(&DeviceId::Uuid("raid".into()), &devices).unwrap();
         assert_eq!(found.device.kname, "dm-3");
-        assert_eq!(found.containers.iter().map(|c| c.kname.as_str()).collect::<Vec<_>>(), ["sda1", "md0"]);
+        assert_eq!(
+            found.containers.iter().map(|c| c.kname.as_str()).collect::<Vec<_>>(),
+            ["sda1", "md0"]
+        );
     }
 
     #[test]
@@ -496,12 +558,18 @@ mod tests {
             fs(dev("dm-1", 254, 1), "ext4", "lv1", None),
             fs(dev("dm-2", 254, 2), "ext4", "lv2", None),
         ];
-        assert!(matches!(find_device(&DeviceId::Uuid("pv".into()), &devices), Err(Error::MultipleHolders { .. })));
+        assert!(matches!(
+            find_device(&DeviceId::Uuid("pv".into()), &devices),
+            Err(Error::MultipleHolders { .. })
+        ));
     }
 
     #[test]
     fn nothing_to_search() {
-        assert!(matches!(find_device(&DeviceId::PartUuid("p".into()), &[]), Err(Error::DeviceNotFound { .. })));
+        assert!(matches!(
+            find_device(&DeviceId::PartUuid("p".into()), &[]),
+            Err(Error::DeviceNotFound { .. })
+        ));
     }
 
     #[test]
@@ -596,7 +664,8 @@ mod tests {
     fn btrfs_mounts_match_by_source() {
         let table = basic_table();
         let tree = MountTree::new(&table);
-        let ids: Vec<u32> = device_mounts(&system_disk(), &tree, no_nodes).iter().map(|m| m.id).collect();
+        let ids: Vec<u32> =
+            device_mounts(&system_disk(), &tree, no_nodes).iter().map(|m| m.id).collect();
         assert_eq!(ids, [40, 61]);
     }
 
@@ -609,8 +678,10 @@ mod tests {
         ];
         let tree = MountTree::new(&table);
         let ntfs = fs(dev("sdc1", 8, 33), "ntfs", "0123ABCD", Some("WIN"));
-        let resolved = ResolvedDevice { device: ntfs.clone(), members: vec![ntfs], containers: vec![] };
-        let lookup = |p: &Path| (p == Path::new("/dev/disk/by-uuid/0123ABCD")).then_some(DevNum::new(8, 33));
+        let resolved =
+            ResolvedDevice { device: ntfs.clone(), members: vec![ntfs], containers: vec![] };
+        let lookup =
+            |p: &Path| (p == Path::new("/dev/disk/by-uuid/0123ABCD")).then_some(DevNum::new(8, 33));
         let found = device_mounts(&resolved, &tree, lookup);
         assert_eq!(found.iter().map(|m| m.id).collect::<Vec<_>>(), [2]);
     }
@@ -624,7 +695,8 @@ mod tests {
         let tree = MountTree::new(&table);
         let mut inner = fs(dev("dm-0", 254, 0), "btrfs", "in", None);
         inner.dm_name = Some("luks-abc".into());
-        let resolved = ResolvedDevice { device: inner.clone(), members: vec![inner], containers: vec![] };
+        let resolved =
+            ResolvedDevice { device: inner.clone(), members: vec![inner], containers: vec![] };
         assert_eq!(device_mounts(&resolved, &tree, no_nodes).len(), 1);
     }
 
@@ -699,7 +771,10 @@ mod tests {
         let resolved = ResolvedDevice { device: d.clone(), members: vec![d], containers: vec![] };
         let mounts = device_mounts(&resolved, &tree, no_nodes);
         assert_eq!(locate(&path("@data/a"), &mounts).unwrap().path, Path::new("/data/a"));
-        assert_eq!(locate(&path("other"), &mounts).unwrap().path, Path::new("/run/media/u/D/other"));
+        assert_eq!(
+            locate(&path("other"), &mounts).unwrap().path,
+            Path::new("/run/media/u/D/other")
+        );
         assert_eq!(locate(&path("."), &mounts).unwrap().path, Path::new("/run/media/u/D"));
     }
 

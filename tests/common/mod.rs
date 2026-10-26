@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -23,7 +23,14 @@ pub fn mkdir(base: &Path, rel: &str) -> PathBuf {
     fs::canonicalize(dir).unwrap()
 }
 
-pub fn device(kname: &str, major: u32, minor: u32, fstype: &str, uuid: &str, label: Option<&str>) -> BlockDevice {
+pub fn device(
+    kname: &str,
+    major: u32,
+    minor: u32,
+    fstype: &str,
+    uuid: &str,
+    label: Option<&str>,
+) -> BlockDevice {
     BlockDevice {
         kname: kname.into(),
         devnode: PathBuf::from("/dev").join(kname),
@@ -45,6 +52,10 @@ pub struct FakeSystem {
     pub calls: RefCell<Vec<String>>,
     /// Make the next mounts fail.
     pub fail_mounts: bool,
+    /// Make every unmount fail.
+    pub fail_unmounts: bool,
+    /// How many more reads of the mount table succeed before every one fails; `None`: all do.
+    pub mount_table_reads: Cell<Option<usize>>,
     next_id: RefCell<u32>,
 }
 
@@ -67,6 +78,8 @@ impl FakeSystem {
             automount_dir,
             calls: RefCell::new(Vec::new()),
             fail_mounts: false,
+            fail_unmounts: false,
+            mount_table_reads: Cell::new(None),
             next_id: RefCell::new(100),
         }
     }
@@ -80,11 +93,28 @@ impl FakeSystem {
     /// Mounts `root` (a path inside the device) of `kname` at `at`.
     pub fn add_mount(&self, kname: &str, root: &str, at: &Path) -> u32 {
         let dev = self.devices.iter().find(|d| d.kname == kname).expect("known device");
-        let devnum = if dev.fstype.as_deref() == Some("btrfs") { DevNum::new(0, 500 + dev.devnum.minor) } else { dev.devnum };
-        self.add_entry(devnum, root, at, dev.fstype.as_deref().unwrap_or("?"), &dev.devnode.display().to_string())
+        let devnum = if dev.fstype.as_deref() == Some("btrfs") {
+            DevNum::new(0, 500 + dev.devnum.minor)
+        } else {
+            dev.devnum
+        };
+        self.add_entry(
+            devnum,
+            root,
+            at,
+            dev.fstype.as_deref().unwrap_or("?"),
+            &dev.devnode.display().to_string(),
+        )
     }
 
-    pub fn add_entry(&self, devnum: DevNum, root: &str, at: &Path, fstype: &str, source: &str) -> u32 {
+    pub fn add_entry(
+        &self,
+        devnum: DevNum,
+        root: &str,
+        at: &Path,
+        fstype: &str,
+        source: &str,
+    ) -> u32 {
         let id = self.id();
         // The parent is whatever the mount point currently lives in.
         let parent_id = {
@@ -113,6 +143,11 @@ impl System for FakeSystem {
     }
 
     fn mounts(&self) -> Result<Vec<MountEntry>> {
+        match self.mount_table_reads.get() {
+            Some(0) => return Err(devmounts::Error::MountTable { message: "simulated".into() }),
+            Some(left) => self.mount_table_reads.set(Some(left - 1)),
+            None => {}
+        }
         Ok(self.mounts.borrow().clone())
     }
 
@@ -133,7 +168,10 @@ impl System for FakeSystem {
             request.top_level
         ));
         if self.fail_mounts {
-            return Err(devmounts::Error::MountFailed { device: dev.describe(), message: "simulated".into() });
+            return Err(devmounts::Error::MountFailed {
+                device: dev.describe(),
+                message: "simulated".into(),
+            });
         }
         let at = devmounts::mount::mount_dir(&request.mount_base, dev);
         fs::create_dir_all(&at).unwrap();
@@ -142,7 +180,14 @@ impl System for FakeSystem {
     }
 
     fn unmount(&self, request: &UnmountRequest<'_>) -> Result<()> {
-        self.calls.borrow_mut().push(format!("unmount {}", request.mount.mount_point.display()));
+        let mount_point = &request.mount.mount_point;
+        self.calls.borrow_mut().push(format!("unmount {}", mount_point.display()));
+        if self.fail_unmounts {
+            return Err(devmounts::Error::UnmountFailed {
+                mount_point: mount_point.clone(),
+                message: "simulated".into(),
+            });
+        }
         self.mounts.borrow_mut().retain(|m| m.id != request.mount.id);
         Ok(())
     }

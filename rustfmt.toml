@@ -1,0 +1,10 @@
+# `cargo fmt`'s settings, kept in the repo so the formatting is the same for everyone.
+
+style_edition = "2024"
+
+# rustfmt's own default, written out so it can't drift with an editor's settings.
+max_width = 100
+
+# Short constructs — small struct literals, one-line `if`/`match` arms, short calls — stay on one
+# line instead of being spread over several; the code leans on that density to read as one thought.
+use_small_heuristics = "Max"

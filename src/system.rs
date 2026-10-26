@@ -86,6 +86,9 @@ pub struct MountRequest<'a> {
 pub struct UnmountRequest<'a> {
     pub device: &'a BlockDevice,
     pub mount: &'a MountEntry,
+    /// How devices are mounted (`mount_method`): with `udisks`, an automounter's mount comes down
+    /// through udisks2 alone, its own password prompt included.
+    pub method: MountMethod,
     pub mount_base: PathBuf,
     /// The run's way to root, for `umount` and the mount point.
     pub privileges: &'a Privileges,
@@ -133,16 +136,21 @@ impl LinuxSystem {
     }
 
     /// Like [`LinuxSystem::new`], but `DEVMOUNTS_SYSFS`, `DEVMOUNTS_UDEV_DATA`,
-    /// `DEVMOUNTS_MOUNTINFO` and `DEVMOUNTS_DEV` override the respective paths.
+    /// `DEVMOUNTS_MOUNTINFO` and `DEVMOUNTS_DEV` override the respective paths, and
+    /// `DEVMOUNTS_AUTOMOUNT_DIRS` (`:`-separated, like `PATH`) the automounters' directories.
     pub fn from_env() -> Self {
-        let var = |name: &str, default: PathBuf| std::env::var_os(name).map(PathBuf::from).unwrap_or(default);
+        let var = |name: &str, default: PathBuf| {
+            std::env::var_os(name).map(PathBuf::from).unwrap_or(default)
+        };
         let d = Self::default();
         LinuxSystem {
             sysfs: var("DEVMOUNTS_SYSFS", d.sysfs),
             udev_data: var("DEVMOUNTS_UDEV_DATA", d.udev_data),
             mountinfo: var("DEVMOUNTS_MOUNTINFO", d.mountinfo),
             dev: var("DEVMOUNTS_DEV", d.dev),
-            automount_dirs: d.automount_dirs,
+            automount_dirs: std::env::var_os("DEVMOUNTS_AUTOMOUNT_DIRS")
+                .map(|dirs| std::env::split_paths(&dirs).collect())
+                .unwrap_or(d.automount_dirs),
         }
     }
 
@@ -153,14 +161,19 @@ impl LinuxSystem {
         // DEVNAME is the node path below /dev; sysfs spells '/' as '!' (cciss!c0d0).
         let devname = fs::read_to_string(dir.join("uevent"))
             .ok()
-            .and_then(|uevent| uevent.lines().find_map(|l| l.strip_prefix("DEVNAME=")).map(str::to_owned))
+            .and_then(|uevent| {
+                uevent.lines().find_map(|l| l.strip_prefix("DEVNAME=")).map(str::to_owned)
+            })
             .unwrap_or_else(|| kname.replace('!', "/"));
         let mut holders: Vec<String> = match fs::read_dir(dir.join("holders")) {
             Ok(entries) => entries.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect(),
             Err(_) => Vec::new(),
         };
         holders.sort();
-        let dm_name = fs::read_to_string(dir.join("dm/name")).ok().map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+        let dm_name = fs::read_to_string(dir.join("dm/name"))
+            .ok()
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty());
 
         let mut device = BlockDevice {
             kname: kname.to_owned(),
@@ -173,7 +186,9 @@ impl LinuxSystem {
         };
         let db = self.udev_data.join(format!("b{}:{}", devnum.major, devnum.minor));
         if let Ok(bytes) = fs::read(db) {
-            device.set_identity(udev::identity(&udev::parse_properties(&String::from_utf8_lossy(&bytes))));
+            device.set_identity(udev::identity(&udev::parse_properties(&String::from_utf8_lossy(
+                &bytes,
+            ))));
         }
         Ok(device)
     }
@@ -184,7 +199,8 @@ impl System for LinuxSystem {
         let class = self.sysfs.join("class/block");
         let entries = fs::read_dir(&class)
             .map_err(|err| Error::Inventory { message: format!("{}: {err}", class.display()) })?;
-        let mut knames: Vec<String> = entries.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect();
+        let mut knames: Vec<String> =
+            entries.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect();
         knames.sort();
 
         let mut devices = Vec::new();
@@ -212,8 +228,9 @@ impl System for LinuxSystem {
     }
 
     fn mounts(&self) -> Result<Vec<MountEntry>> {
-        let bytes = fs::read(&self.mountinfo)
-            .map_err(|err| Error::MountTable { message: format!("{}: {err}", self.mountinfo.display()) })?;
+        let bytes = fs::read(&self.mountinfo).map_err(|err| Error::MountTable {
+            message: format!("{}: {err}", self.mountinfo.display()),
+        })?;
         mountinfo::parse(&bytes).map_err(|message| Error::MountTable { message })
     }
 
@@ -236,10 +253,11 @@ impl System for LinuxSystem {
 }
 
 fn lsblk_identities() -> Option<HashMap<String, Identity>> {
-    let argv: Vec<OsString> = ["lsblk", "-J", "-l", "-o", "KNAME,FSTYPE,UUID,LABEL,PARTUUID,PARTLABEL"]
-        .iter()
-        .map(OsString::from)
-        .collect();
+    let argv: Vec<OsString> =
+        ["lsblk", "-J", "-l", "-o", "KNAME,FSTYPE,UUID,LABEL,PARTUUID,PARTLABEL"]
+            .iter()
+            .map(OsString::from)
+            .collect();
     let output = escalate::output(&argv).ok().filter(|o| o.status.success())?;
     parse_lsblk_json(&String::from_utf8_lossy(&output.stdout))
 }
@@ -249,7 +267,9 @@ pub fn parse_lsblk_json(text: &str) -> Option<HashMap<String, Identity>> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let mut out = HashMap::new();
     for dev in value.get("blockdevices")?.as_array()? {
-        let field = |name: &str| dev.get(name).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
+        let field = |name: &str| {
+            dev.get(name).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned)
+        };
         let Some(kname) = field("kname") else { continue };
         out.insert(
             kname,

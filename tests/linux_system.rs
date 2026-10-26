@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use common::{mkdir, tmpdir};
-use devmounts::{Colors, Config, DevNum, Error, Escalation, LinkOutcome, LinuxSystem, Options, System};
+use devmounts::{
+    Colors, Config, DevNum, Error, Escalation, LinkOutcome, LinuxSystem, Options, System,
+};
 use tempfile::TempDir;
 
 struct Machine {
@@ -27,7 +29,15 @@ struct Dev<'a> {
 
 impl Default for Dev<'_> {
     fn default() -> Self {
-        Dev { kname: "", num: (0, 0), devname: None, partition: true, holders: &[], dm_name: None, udev: None }
+        Dev {
+            kname: "",
+            num: (0, 0),
+            devname: None,
+            partition: true,
+            holders: &[],
+            dm_name: None,
+            udev: None,
+        }
     }
 }
 
@@ -72,7 +82,8 @@ impl Machine {
     }
 
     fn mountinfo(&self, extra: &str) {
-        fs::write(&self.system.mountinfo, format!("1 0 0:1 / / rw - rootfs none rw\n{extra}")).unwrap();
+        fs::write(&self.system.mountinfo, format!("1 0 0:1 / / rw - rootfs none rw\n{extra}"))
+            .unwrap();
     }
 
     fn devnode(&self, name: &str) -> PathBuf {
@@ -85,8 +96,20 @@ const NVME_ROOT: &str = "E:ID_FS_TYPE=btrfs\nE:ID_FS_UUID=0a0a0a0a\nE:ID_FS_UUID
 #[test]
 fn reads_all_kinds_of_devices() {
     let m = Machine::new();
-    m.add(Dev { kname: "nvme0n1", num: (259, 0), devname: Some("nvme0n1"), partition: false, ..Dev::default() });
-    m.add(Dev { kname: "nvme0n1p2", num: (259, 2), devname: Some("nvme0n1p2"), udev: Some(NVME_ROOT), ..Dev::default() });
+    m.add(Dev {
+        kname: "nvme0n1",
+        num: (259, 0),
+        devname: Some("nvme0n1"),
+        partition: false,
+        ..Dev::default()
+    });
+    m.add(Dev {
+        kname: "nvme0n1p2",
+        num: (259, 2),
+        devname: Some("nvme0n1p2"),
+        udev: Some(NVME_ROOT),
+        ..Dev::default()
+    });
     m.add(Dev {
         kname: "mmcblk0p1",
         num: (179, 1),
@@ -121,11 +144,17 @@ fn reads_all_kinds_of_devices() {
         ..Dev::default()
     });
     // sysfs writes '/' in names as '!'; DEVNAME has the real path.
-    m.add(Dev { kname: "cciss!c0d0p1", num: (104, 1), devname: Some("cciss/c0d0p1"), ..Dev::default() });
+    m.add(Dev {
+        kname: "cciss!c0d0p1",
+        num: (104, 1),
+        devname: Some("cciss/c0d0p1"),
+        ..Dev::default()
+    });
     m.add(Dev { kname: "cciss!c0d1", num: (104, 16), partition: false, ..Dev::default() });
 
     let devices = m.system.block_devices().unwrap();
-    let get = |k: &str| devices.iter().find(|d| d.kname == k).unwrap_or_else(|| panic!("{k} missing"));
+    let get =
+        |k: &str| devices.iter().find(|d| d.kname == k).unwrap_or_else(|| panic!("{k} missing"));
 
     let root = get("nvme0n1p2");
     assert_eq!(root.devnode, m.devnode("nvme0n1p2"));
@@ -158,7 +187,11 @@ fn devices_that_vanish_are_skipped() {
 #[test]
 fn missing_sources_are_errors() {
     let m = Machine::new();
-    let broken = LinuxSystem { sysfs: m.base.join("nope"), mountinfo: m.base.join("nope"), ..m.system.clone() };
+    let broken = LinuxSystem {
+        sysfs: m.base.join("nope"),
+        mountinfo: m.base.join("nope"),
+        ..m.system.clone()
+    };
     assert!(matches!(broken.block_devices(), Err(Error::Inventory { .. })));
     assert!(matches!(broken.mounts(), Err(Error::MountTable { .. })));
     fs::write(&m.system.mountinfo, "garbage\n").unwrap();
@@ -183,7 +216,13 @@ fn applies_through_the_linux_backend() {
         udev: Some("E:ID_FS_TYPE=ext4\nE:ID_FS_UUID=u1\nE:ID_FS_LABEL_ENC=My\\x20Backup\n"),
         ..Dev::default()
     });
-    m.add(Dev { kname: "nvme0n1p2", num: (259, 2), devname: Some("nvme0n1p2"), udev: Some(NVME_ROOT), ..Dev::default() });
+    m.add(Dev {
+        kname: "nvme0n1p2",
+        num: (259, 2),
+        devname: Some("nvme0n1p2"),
+        udev: Some(NVME_ROOT),
+        ..Dev::default()
+    });
 
     let backup = mkdir(&m.base, "media/My Backup");
     mkdir(&backup, "docs");
@@ -216,7 +255,11 @@ fn applies_through_the_linux_backend() {
     assert!(report.ok(), "{}", report.render(Colors::Plain));
     assert_eq!(fs::read_link(root.join("backup")).unwrap(), backup);
     assert_eq!(fs::read_link(root.join("docs")).unwrap(), root.join("backup/docs"));
-    assert_eq!(fs::read_link(root.join("system")).unwrap(), top, "the whole filesystem, not a subvolume");
+    assert_eq!(
+        fs::read_link(root.join("system")).unwrap(),
+        top,
+        "the whole filesystem, not a subvolume"
+    );
     assert_eq!(fs::read_link(root.join("proj")).unwrap(), root.join("system/@home/me/projects"));
 
     let listing = devmounts::list_devices(&m.system).unwrap();
@@ -227,12 +270,20 @@ fn applies_through_the_linux_backend() {
 #[test]
 fn not_mounted_and_not_allowed_to_mount() {
     let m = Machine::new();
-    m.add(Dev { kname: "sdb1", num: (8, 17), udev: Some("E:ID_FS_TYPE=ext4\nE:ID_FS_LABEL=X\n"), ..Dev::default() });
-    let config: Config =
-        format!("settings.root = {:?}\n[[device]]\nlabel = 'X'\ndevmount = 'x'\nmounts = {{ y = 'y' }}", m.base)
-            .parse()
-            .unwrap();
-    let options = Options { no_mount: true, escalation: Some(Escalation::Never), ..Options::default() };
+    m.add(Dev {
+        kname: "sdb1",
+        num: (8, 17),
+        udev: Some("E:ID_FS_TYPE=ext4\nE:ID_FS_LABEL=X\n"),
+        ..Dev::default()
+    });
+    let config: Config = format!(
+        "settings.root = {:?}\n[[device]]\nlabel = 'X'\ndevmount = 'x'\nmounts = {{ y = 'y' }}",
+        m.base
+    )
+    .parse()
+    .unwrap();
+    let options =
+        Options { no_mount: true, escalation: Some(Escalation::Never), ..Options::default() };
     let report = devmounts::apply(&config, &options, &m.system).unwrap();
     assert!(matches!(report.devices[0].mounts[0].outcome, LinkOutcome::Skipped));
     match &report.devices[0].devmount.outcome {
