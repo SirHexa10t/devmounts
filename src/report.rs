@@ -37,7 +37,8 @@ pub struct DeviceReport {
     pub containers: Vec<String>,
     /// Where the device's filesystem is mounted (after any mounting done in this run).
     pub mounted_at: Vec<MountSummary>,
-    /// What this run mounted and unmounted, or would (dry run) — every unmount's outcome its own.
+    /// What this run mounted, unmounted, unlocked and locked, or would (dry run) — every
+    /// unmount's and lock's outcome its own.
     pub mount_changes: Vec<MountChange>,
     /// A device-level problem (not found, ambiguous, mount failed, the mount table unreadable, …).
     pub error: Option<Error>,
@@ -81,12 +82,35 @@ pub enum MountChange {
     LeftMounted {
         mount_point: PathBuf,
     },
+    /// A locked LUKS container, opened to reach the device in it.
+    Unlocked {
+        container: PathBuf,
+    },
+    WouldUnlock {
+        container: PathBuf,
+    },
+    /// A LUKS container closed again, none of its device's mounts being left.
+    Locked {
+        container: PathBuf,
+    },
+    WouldLock {
+        container: PathBuf,
+    },
+    LockFailed {
+        container: PathBuf,
+        error: Error,
+    },
+    /// Left open, as the device in it is still mounted there.
+    LeftUnlocked {
+        container: PathBuf,
+        mounted_at: Vec<PathBuf>,
+    },
 }
 
 impl MountChange {
-    /// Whether this change counts as a problem: an unmount that failed.
+    /// Whether this change counts as a problem: an unmount or a lock that failed.
     pub fn is_problem(&self) -> bool {
-        matches!(self, MountChange::UnmountFailed { .. })
+        matches!(self, MountChange::UnmountFailed { .. } | MountChange::LockFailed { .. })
     }
 }
 
@@ -293,10 +317,30 @@ fn render_device(out: &mut String, s: &Style, device: &DeviceReport, dry_run: bo
             MountChange::WouldUnmount { mount_point } => {
                 s.note(&format!("would unmount {}", mount_point.display()))
             }
-            MountChange::UnmountFailed { error, .. } => format!("{} {error}", s.bad("✗")),
+            MountChange::UnmountFailed { error, .. } | MountChange::LockFailed { error, .. } => {
+                format!("{} {error}", s.bad("✗"))
+            }
             MountChange::LeftMounted { mount_point } => {
                 left.push(mount_point.display().to_string());
                 continue;
+            }
+            MountChange::Unlocked { container } => {
+                s.good(&format!("unlocked {}", container.display()))
+            }
+            MountChange::WouldUnlock { container } => {
+                s.note(&format!("would unlock {}", container.display()))
+            }
+            MountChange::Locked { container } => s.good(&format!("locked {}", container.display())),
+            MountChange::WouldLock { container } => {
+                s.note(&format!("would lock {}", container.display()))
+            }
+            MountChange::LeftUnlocked { container, mounted_at } => {
+                let at: Vec<String> = mounted_at.iter().map(|p| p.display().to_string()).collect();
+                s.dim(&format!(
+                    "left {} unlocked: still mounted at {}",
+                    container.display(),
+                    at.join(", ")
+                ))
             }
         };
         let _ = writeln!(out, "  {line}");

@@ -7,6 +7,7 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -87,12 +88,32 @@ pub fn run(argv: &[OsString]) -> Result<()> {
     }
 }
 
+/// Runs a command that asks the user something itself (a passphrase): stdin is the terminal's,
+/// and everything it prints goes to stderr — where a prompt belongs, and never into stdout, which
+/// may be carrying a report. None of it is captured, so a failure says only how the command
+/// ended: its own words were shown as it ran.
+pub fn run_on_terminal(argv: &[OsString]) -> Result<()> {
+    let (program, args) = split_program(argv)?;
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(io::stderr())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|err| Error::CommandFailed {
+            command: display_command(argv),
+            message: err.to_string(),
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::CommandFailed { command: display_command(argv), message: status.to_string() })
+    }
+}
+
 /// Runs a command and returns its output regardless of the exit status.
 pub fn output(argv: &[OsString]) -> Result<std::process::Output> {
-    let (program, args) = argv.split_first().ok_or_else(|| Error::CommandFailed {
-        command: String::new(),
-        message: "empty command".into(),
-    })?;
+    let (program, args) = split_program(argv)?;
     Command::new(program)
         .args(args)
         .stdin(Stdio::inherit())
@@ -103,6 +124,14 @@ pub fn output(argv: &[OsString]) -> Result<std::process::Output> {
             command: display_command(argv),
             message: err.to_string(),
         })
+}
+
+/// A command line's program and its arguments, or the error for a command line with neither.
+fn split_program(argv: &[OsString]) -> Result<(&OsString, &[OsString])> {
+    argv.split_first().ok_or_else(|| Error::CommandFailed {
+        command: String::new(),
+        message: "empty command".into(),
+    })
 }
 
 pub(crate) fn failure_message(output: &std::process::Output) -> String {

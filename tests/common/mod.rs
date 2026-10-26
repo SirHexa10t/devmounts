@@ -6,10 +6,13 @@
 #![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use devmounts::{BlockDevice, DevNum, MountEntry, MountRequest, Result, System, UnmountRequest};
+use devmounts::{
+    BlockDevice, ContainerRequest, DevNum, MountEntry, MountRequest, Result, System, UnmountRequest,
+};
 use tempfile::TempDir;
 
 pub fn tmpdir() -> TempDir {
@@ -44,7 +47,9 @@ pub fn device(
 }
 
 pub struct FakeSystem {
-    pub devices: Vec<BlockDevice>,
+    pub devices: RefCell<Vec<BlockDevice>>,
+    /// Locked LUKS containers, by kernel name, with the device unlocking each one opens.
+    locked: RefCell<HashMap<String, BlockDevice>>,
     pub mounts: RefCell<Vec<MountEntry>>,
     /// Where the machine's automounter mounts devices.
     pub automount_dir: PathBuf,
@@ -56,6 +61,10 @@ pub struct FakeSystem {
     pub fail_unmounts: bool,
     /// How many more reads of the mount table succeed before every one fails; `None`: all do.
     pub mount_table_reads: Cell<Option<usize>>,
+    /// Make every unlock fail.
+    pub fail_unlocks: bool,
+    /// Make every lock fail.
+    pub fail_locks: bool,
     next_id: RefCell<u32>,
 }
 
@@ -73,13 +82,16 @@ impl FakeSystem {
             super_options: "rw".into(),
         };
         FakeSystem {
-            devices,
+            devices: RefCell::new(devices),
+            locked: RefCell::new(HashMap::new()),
             mounts: RefCell::new(vec![root]),
             automount_dir,
             calls: RefCell::new(Vec::new()),
             fail_mounts: false,
             fail_unmounts: false,
             mount_table_reads: Cell::new(None),
+            fail_unlocks: false,
+            fail_locks: false,
             next_id: RefCell::new(100),
         }
     }
@@ -90,9 +102,17 @@ impl FakeSystem {
         *next
     }
 
+    /// A locked LUKS container, `container`, whose unlocking opens `inside` — stacked on it, as
+    /// dm-crypt's cleartext device is.
+    pub fn add_locked(&self, container: BlockDevice, inside: BlockDevice) {
+        self.locked.borrow_mut().insert(container.kname.clone(), inside);
+        self.devices.borrow_mut().push(container);
+    }
+
     /// Mounts `root` (a path inside the device) of `kname` at `at`.
     pub fn add_mount(&self, kname: &str, root: &str, at: &Path) -> u32 {
-        let dev = self.devices.iter().find(|d| d.kname == kname).expect("known device");
+        let dev =
+            self.devices.borrow().iter().find(|d| d.kname == kname).expect("known device").clone();
         let devnum = if dev.fstype.as_deref() == Some("btrfs") {
             DevNum::new(0, 500 + dev.devnum.minor)
         } else {
@@ -139,7 +159,7 @@ impl FakeSystem {
 
 impl System for FakeSystem {
     fn block_devices(&self) -> Result<Vec<BlockDevice>> {
-        Ok(self.devices.clone())
+        Ok(self.devices.borrow().clone())
     }
 
     fn mounts(&self) -> Result<Vec<MountEntry>> {
@@ -189,6 +209,43 @@ impl System for FakeSystem {
             });
         }
         self.mounts.borrow_mut().retain(|m| m.id != request.mount.id);
+        Ok(())
+    }
+
+    fn unlock(&self, request: &ContainerRequest<'_>) -> Result<()> {
+        let container = request.container;
+        self.calls.borrow_mut().push(format!("unlock {}", container.kname));
+        if self.fail_unlocks {
+            return Err(devmounts::Error::UnlockFailed {
+                container: container.devnode.clone(),
+                message: "simulated".into(),
+            });
+        }
+        let inside = self.locked.borrow_mut().remove(&container.kname).expect("a locked container");
+        let mut devices = self.devices.borrow_mut();
+        let held =
+            devices.iter_mut().find(|d| d.kname == container.kname).expect("known container");
+        held.holders = vec![inside.kname.clone()];
+        devices.push(inside);
+        Ok(())
+    }
+
+    fn lock(&self, request: &ContainerRequest<'_>) -> Result<()> {
+        let container = request.container;
+        self.calls.borrow_mut().push(format!("lock {}", container.kname));
+        if self.fail_locks {
+            return Err(devmounts::Error::LockFailed {
+                container: container.devnode.clone(),
+                message: "simulated".into(),
+            });
+        }
+        let mut devices = self.devices.borrow_mut();
+        let held =
+            devices.iter_mut().find(|d| d.kname == container.kname).expect("known container");
+        let [inside] = std::mem::take(&mut held.holders).try_into().expect("one device inside");
+        let at = devices.iter().position(|d| d.kname == inside).expect("the device inside");
+        let inside = devices.remove(at);
+        self.locked.borrow_mut().insert(container.kname.clone(), inside);
         Ok(())
     }
 }

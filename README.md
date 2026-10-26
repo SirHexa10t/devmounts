@@ -95,7 +95,8 @@ covers them.
   asks twice. Without udisks2, or as root, `auto` is `mount`.
 - `"mount"`: `mount` into `<mount_base>/<uuid>` (`mount_base` is `/run/devmounts` by
   default), a directory made for it and removed again when it's unmounted.
-- `"udisks"`: udisks2 only, for unmounting too, its own password prompt included.
+- `"udisks"`: udisks2 only, for unmounting, unlocking and locking too, its own password
+  prompt included.
 - If a device is mounted only in parts (e.g. btrfs subvolumes, like a system disk), its
   top level is mounted into `mount_base` (`subvolid=5`) for the devmount.
 - `remove --unmount` unmounts the device where it's mounted inside `/run/media` or
@@ -105,8 +106,14 @@ covers them.
   the way `auto` mounts (udisks2, or `umount` through the helper where udisks2 wants a
   password), devmounts' own with `umount`; each unmount is reported on its own, and one
   failing doesn't stop the others.
-- Containers (LUKS, RAID members, single-LV LVM) are followed to the filesystem on top;
-  locked ones are reported with a hint (`udisksctl unlock -b …`).
+- Containers (LUKS, RAID members, single-LV LVM) are followed to the filesystem on top. A
+  locked LUKS container is unlocked with udisks2 when the device may be mounted
+  (`automount`, and no `--no-mount`); a dry run says it would. udisksctl asks for the
+  passphrase itself, on the terminal, so devmounts never sees it. Name such a device by its
+  container (its LUKS `uuid`, `partuuid` or `partlabel`): what's inside can't be seen while
+  it's locked. `remove --unmount` locks it again once none of its mounts is left; one still
+  mounted elsewhere is left unlocked, and the report says where. Other inactive containers
+  are reported with a hint (`mdadm --assemble`, `vgchange -ay`).
 
 ## Privileges
 
@@ -115,12 +122,12 @@ your own needs nothing more. Steps that meet a permission error (a link in `/`, 
 `mount` and `umount`, which always need root, go to the run's privileged helper instead.
 The helper is devmounts itself, started through `sudo`, `doas` or `run0` (the first one
 found, or the `escalate` setting / `--escalate`) when a step first needs it, and kept for
-the rest of the run. So a run asks for a password at most once (udisks2's own prompt
-aside, with `mount_method = "udisks"`), and not at all when nothing needs root. If the
-helper can't be started or the password is refused, each step that needed it says so
-(`can't get privileges: …`), and there's no second prompt. `escalate = "none"` never
-escalates, and those steps fail with their own error. As root, everything is done
-directly.
+the rest of the run. So a run asks for a password at most once (udisks2's own prompts
+aside: a LUKS passphrase, and its authorization with `mount_method = "udisks"`), and not
+at all when nothing needs root. If the helper can't be started or the password is refused,
+each step that needed it says so (`can't get privileges: …`), and there's no second
+prompt. `escalate = "none"` never escalates, and those steps fail with their own error. As
+root, everything is done directly.
 
 ## As a library
 

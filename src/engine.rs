@@ -6,6 +6,7 @@
 //! every mount link points *through* it (`<root>/<name> -> <root>/<devmount>/<path>`), so a
 //! device that moves or is swapped only needs its devmount re-pointed.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -22,7 +23,7 @@ use crate::report::{
     Command, DeviceReport, LinkOutcome, LinkReport, MountChange, MountSummary, Report,
 };
 use crate::resolve::{self, MountTree, ResolvedDevice};
-use crate::system::{BlockDevice, MountRequest, System, UnmountRequest};
+use crate::system::{BlockDevice, ContainerRequest, MountRequest, System, UnmountRequest};
 
 /// Run-time switches; `None`/`false` means "as configured".
 #[derive(Debug, Clone, Default)]
@@ -106,7 +107,7 @@ fn run(
         config,
         options,
         system,
-        devices: system.block_devices()?,
+        devices: RefCell::new(system.block_devices()?),
         automount_dirs: system.automount_dirs(),
         root: options.root.clone().unwrap_or_else(|| config.settings.root.clone()),
         privileges: Privileges::new(
@@ -136,11 +137,22 @@ struct Context<'a> {
     config: &'a Config,
     options: &'a Options,
     system: &'a dyn System,
-    devices: Vec<BlockDevice>,
+    /// The block devices as last read: again after an unlock, which adds the one it opens.
+    devices: RefCell<Vec<BlockDevice>>,
     automount_dirs: Vec<PathBuf>,
     root: PathBuf,
     /// Shared by every step of the run, so it asks for a password at most once.
     privileges: Privileges,
+}
+
+/// What `apply` can go on with for a device.
+enum Opened {
+    /// The device, found — unlocked first, when it was in a locked container.
+    Device(Box<ResolvedDevice>),
+    /// A dry run, at the locked container it would unlock: what's inside isn't known.
+    WouldUnlock,
+    /// Nothing; why is in the report.
+    Nothing,
 }
 
 /// What a device's mounts look like, for one device in one run.
@@ -192,7 +204,17 @@ impl<'t> Mounted<'t> {
 
 impl Context<'_> {
     fn find(&self, spec: &DeviceSpec, report: &mut DeviceReport) -> Option<ResolvedDevice> {
-        match resolve::find_device(&spec.id, &self.devices) {
+        let found = resolve::find_device(&spec.id, &self.devices.borrow());
+        self.found(found, report)
+    }
+
+    /// What looking for a device came to, recorded in its report.
+    fn found(
+        &self,
+        found: Result<ResolvedDevice>,
+        report: &mut DeviceReport,
+    ) -> Option<ResolvedDevice> {
+        match found {
             Ok(found) => {
                 report.device = Some(found.device.describe());
                 report.containers = found.containers.iter().map(BlockDevice::describe).collect();
@@ -207,6 +229,52 @@ impl Context<'_> {
                 None
             }
         }
+    }
+
+    /// Whether `spec`'s device may be mounted — and so unlocked, opening its container being part
+    /// of making it available.
+    fn may_mount(&self, spec: &DeviceSpec) -> bool {
+        spec.automount(&self.config.settings) && !self.options.no_mount
+    }
+
+    /// [`find`](Self::find), for `apply`: a device in a locked LUKS container — its filesystem out
+    /// of sight until the container is open — is unlocked on the way, when it may be mounted.
+    fn open(&self, spec: &DeviceSpec, report: &mut DeviceReport) -> Opened {
+        let found = resolve::find_device(&spec.id, &self.devices.borrow());
+        let locked = match &found {
+            Err(Error::InactiveContainer { device, fstype, .. })
+                if fstype == resolve::LUKS && self.may_mount(spec) =>
+            {
+                self.devices.borrow().iter().find(|d| d.devnode == *device).cloned()
+            }
+            _ => None,
+        };
+        let opened = |device: Option<ResolvedDevice>| match device {
+            Some(device) => Opened::Device(Box::new(device)),
+            None => Opened::Nothing,
+        };
+        let Some(container) = locked else { return opened(self.found(found, report)) };
+        let devnode = container.devnode.clone();
+        if self.options.dry_run {
+            report.mount_changes.push(MountChange::WouldUnlock { container: devnode });
+            return Opened::WouldUnlock;
+        }
+        let request =
+            ContainerRequest { container: &container, method: self.config.settings.mount_method };
+        if let Err(err) = self.system.unlock(&request) {
+            report.error = Some(err);
+            return Opened::Nothing;
+        }
+        report.mount_changes.push(MountChange::Unlocked { container: devnode });
+        // What it opened shows only in the devices read again.
+        match self.system.block_devices() {
+            Ok(devices) => *self.devices.borrow_mut() = devices,
+            Err(err) => {
+                report.error = Some(err);
+                return Opened::Nothing;
+            }
+        }
+        opened(self.find(spec, report))
     }
 
     /// The mount table as it is now, or `None` with the failed read recorded as the device's
@@ -231,54 +299,65 @@ impl Context<'_> {
 
     fn apply_device(&self, spec: &DeviceSpec) -> DeviceReport {
         let mut report = DeviceReport::new(&self.root, spec);
-        let Some(device) = self.find(spec, &mut report) else { return report };
-        let Some(mut table) = self.mount_table(&mut report) else { return report };
-        // The devmount needs the device's root; mount it if no mount shows it. If the device
-        // is mounted, but only in parts (btrfs subvolumes), its top level is mounted too.
-        let needs_mount = {
-            let mounted = Mounted::new(self, Some(&device), &table);
-            resolve::locate(&DevicePath::root(), &mounted.mounts)
-                .is_none()
-                .then_some(!mounted.mounts.is_empty())
+        let device = match self.open(spec, &mut report) {
+            Opened::Device(device) => Some(*device),
+            // Its links are then what they'd be once it's mounted, as for a mount still to come.
+            Opened::WouldUnlock => None,
+            Opened::Nothing => return report,
         };
-        let mut pending = false;
-        if let Some(top_level) = needs_mount
-            && spec.automount(&self.config.settings)
-            && !self.options.no_mount
-        {
-            if self.options.dry_run {
-                report.mount_changes.push(MountChange::WouldMount { top_level });
-                pending = true;
-            } else {
-                let settings = &self.config.settings;
-                let request = MountRequest {
-                    device: &device.device,
-                    options: spec.mount_options(settings).to_vec(),
-                    method: settings.mount_method,
-                    mount_base: settings.mount_base.clone(),
-                    top_level,
-                    privileges: &self.privileges,
-                };
-                match self.system.mount(&request) {
-                    Ok(()) => {
-                        report.mount_changes.push(MountChange::Mounted { top_level });
-                        // Where it was mounted is only known from the table read again.
-                        let Some(mounted) = self.mount_table(&mut report) else { return report };
-                        table = mounted;
+        let Some(mut table) = self.mount_table(&mut report) else { return report };
+        // An unlock or a mount still to come (dry run) means the root isn't known yet.
+        let mut pending = device.is_none();
+        if let Some(device) = &device {
+            // The devmount needs the device's root; mount it if no mount shows it. If the device
+            // is mounted, but only in parts (btrfs subvolumes), its top level is mounted too.
+            let needs_mount = {
+                let mounted = Mounted::new(self, Some(device), &table);
+                resolve::locate(&DevicePath::root(), &mounted.mounts)
+                    .is_none()
+                    .then_some(!mounted.mounts.is_empty())
+            };
+            if let Some(top_level) = needs_mount
+                && self.may_mount(spec)
+            {
+                if self.options.dry_run {
+                    report.mount_changes.push(MountChange::WouldMount { top_level });
+                    pending = true;
+                } else {
+                    let settings = &self.config.settings;
+                    let request = MountRequest {
+                        device: &device.device,
+                        options: spec.mount_options(settings).to_vec(),
+                        method: settings.mount_method,
+                        mount_base: settings.mount_base.clone(),
+                        top_level,
+                        privileges: &self.privileges,
+                    };
+                    match self.system.mount(&request) {
+                        Ok(()) => {
+                            report.mount_changes.push(MountChange::Mounted { top_level });
+                            // Where it was mounted is only known from the table read again.
+                            let Some(mounted) = self.mount_table(&mut report) else {
+                                return report;
+                            };
+                            table = mounted;
+                        }
+                        Err(err) => report.error = Some(err),
                     }
-                    Err(err) => report.error = Some(err),
                 }
             }
         }
 
-        let mounted = Mounted::new(self, Some(&device), &table);
+        let mounted = Mounted::new(self, device.as_ref(), &table);
         report.mounted_at = summarize(&mounted.mounts);
         let on_device = |p: &Path| mounted.on_device(p);
         let base = &self.config.settings.mount_base;
         let devmount_owned = |p: &Path| mounted.devmount_may_replace(p, base, &self.automount_dirs);
 
-        // A pending mount (dry run) means the root isn't known yet.
-        let device_root = if pending { Ok(None) } else { mounted.device_root(&device).map(Some) };
+        let device_root = match &device {
+            Some(device) if !pending => mounted.device_root(device).map(Some),
+            _ => Ok(None),
+        };
         report.devmount = match &device_root {
             Ok(root) => self.put_link(report.devmount.clone(), root.as_deref(), &devmount_owned),
             Err(err) => report.devmount.clone().fail(err.clone()),
@@ -435,6 +514,7 @@ impl Context<'_> {
             // own outcome is recorded already, so a failed read takes nothing with it.
             if let Some(table) = self.mount_table(&mut report) {
                 report.mounted_at = summarize(&Mounted::new(self, Some(device), &table).mounts);
+                self.lock_containers(device, &mut report);
             }
         } else {
             report.mounted_at = summarize(&mounted.mounts);
@@ -508,6 +588,39 @@ impl Context<'_> {
                     Err(error) => MountChange::UnmountFailed { mount_point, error },
                 });
             }
+        }
+    }
+
+    /// After `remove --unmount`: the device's LUKS containers locked again, innermost first (an
+    /// outer one can't close while one it holds is open), once none of its mounts is left — the
+    /// drive is then safe to unplug. One that something still mounts is left open, and said so.
+    fn lock_containers(&self, device: &ResolvedDevice, report: &mut DeviceReport) {
+        // What stays mounted: what a dry run would leave (it unmounts nothing), or what's left.
+        let remaining: Vec<PathBuf> = if self.options.dry_run {
+            let left = report.mount_changes.iter().filter_map(|change| match change {
+                MountChange::LeftMounted { mount_point } => Some(mount_point.clone()),
+                _ => None,
+            });
+            left.collect()
+        } else {
+            report.mounted_at.iter().map(|mount| mount.mount_point.clone()).collect()
+        };
+        let luks =
+            device.containers.iter().rev().filter(|c| c.fstype.as_deref() == Some(resolve::LUKS));
+        for container in luks {
+            let devnode = container.devnode.clone();
+            let change = if !remaining.is_empty() {
+                MountChange::LeftUnlocked { container: devnode, mounted_at: remaining.clone() }
+            } else if self.options.dry_run {
+                MountChange::WouldLock { container: devnode }
+            } else {
+                let method = self.config.settings.mount_method;
+                match self.system.lock(&ContainerRequest { container, method }) {
+                    Ok(()) => MountChange::Locked { container: devnode },
+                    Err(error) => MountChange::LockFailed { container: devnode, error },
+                }
+            };
+            report.mount_changes.push(change);
         }
     }
 }

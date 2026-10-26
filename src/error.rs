@@ -35,8 +35,8 @@ pub enum Error {
     #[error("{id} matches more than one device: {}", candidates.join(", "))]
     AmbiguousDevice { id: String, candidates: Vec<String> },
 
-    #[error("{device} is a {fstype} container that isn't open/active ({hint})")]
-    InactiveContainer { device: String, fstype: String, hint: String },
+    #[error("{} is a {fstype} container that isn't open/active ({hint})", device.display())]
+    InactiveContainer { device: PathBuf, fstype: String, hint: String },
 
     #[error("{device} is used by several devices ({}); identify the filesystem you want instead", holders.join(", "))]
     MultipleHolders { device: String, holders: Vec<String> },
@@ -73,6 +73,12 @@ pub enum Error {
 
     #[error("unmounting {} failed: {message}", mount_point.display())]
     UnmountFailed { mount_point: PathBuf, message: String },
+
+    #[error("unlocking {} failed: {message}", container.display())]
+    UnlockFailed { container: PathBuf, message: String },
+
+    #[error("locking {} failed: {message}", container.display())]
+    LockFailed { container: PathBuf, message: String },
 
     #[error("`{command}` failed: {message}")]
     CommandFailed { command: String, message: String },
@@ -113,6 +119,8 @@ impl Error {
             Error::LinkBlocked { .. } => "link_blocked",
             Error::MountFailed { .. } => "mount_failed",
             Error::UnmountFailed { .. } => "unmount_failed",
+            Error::UnlockFailed { .. } => "unlock_failed",
+            Error::LockFailed { .. } => "lock_failed",
             Error::CommandFailed { .. } => "command_failed",
             Error::Escalation { .. } => "escalation",
             Error::Io { .. } => "io",

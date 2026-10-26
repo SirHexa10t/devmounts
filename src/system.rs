@@ -94,6 +94,15 @@ pub struct UnmountRequest<'a> {
     pub privileges: &'a Privileges,
 }
 
+/// A LUKS container to open or close; see [`System::unlock`] and [`System::lock`].
+#[derive(Debug, Clone)]
+pub struct ContainerRequest<'a> {
+    pub container: &'a BlockDevice,
+    /// How devices are mounted (`mount_method`): with `udisks`, udisks2 may ask for an
+    /// administrator's password itself, as when mounting.
+    pub method: MountMethod,
+}
+
 pub trait System {
     /// All block devices with their identifiers.
     fn block_devices(&self) -> Result<Vec<BlockDevice>>;
@@ -105,6 +114,11 @@ pub trait System {
     fn automount_dirs(&self) -> Vec<PathBuf>;
     fn mount(&self, request: &MountRequest<'_>) -> Result<()>;
     fn unmount(&self, request: &UnmountRequest<'_>) -> Result<()>;
+    /// Opens the locked LUKS container `request.container`; what opens it asks for the
+    /// passphrase itself.
+    fn unlock(&self, request: &ContainerRequest<'_>) -> Result<()>;
+    /// Closes the LUKS container `request.container` again.
+    fn lock(&self, request: &ContainerRequest<'_>) -> Result<()>;
 }
 
 /// The real machine. Paths can be redirected for tests or unusual setups.
@@ -249,6 +263,14 @@ impl System for LinuxSystem {
 
     fn unmount(&self, request: &UnmountRequest<'_>) -> Result<()> {
         crate::mount::unmount(request)
+    }
+
+    fn unlock(&self, request: &ContainerRequest<'_>) -> Result<()> {
+        crate::mount::unlock(request)
+    }
+
+    fn lock(&self, request: &ContainerRequest<'_>) -> Result<()> {
+        crate::mount::lock(request)
     }
 }
 

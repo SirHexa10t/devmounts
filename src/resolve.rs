@@ -14,8 +14,10 @@ use crate::mountinfo::{DevNum, MountEntry};
 use crate::system::BlockDevice;
 
 /// Types whose contents only become mountable through a device stacked on top.
-const CONTAINERS: &[&str] =
-    &["crypto_LUKS", "BitLocker", "linux_raid_member", "LVM2_member", "bcache"];
+const CONTAINERS: &[&str] = &[LUKS, "BitLocker", "linux_raid_member", "LVM2_member", "bcache"];
+
+/// A LUKS container's type: the one kind devmounts opens itself (with udisks2), and locks again.
+pub const LUKS: &str = "crypto_LUKS";
 
 /// Recognized but not mountable as a filesystem.
 const NOT_FILESYSTEMS: &[&str] = &["swap", "zfs_member", "ceph", "drbd", "VMFS_volume_member"];
@@ -136,7 +138,7 @@ fn unwrap_containers(
         let holder = match current.holders.as_slice() {
             [] => {
                 return Err(Error::InactiveContainer {
-                    device: current.devnode.display().to_string(),
+                    device: current.devnode.clone(),
                     fstype: fstype.to_owned(),
                     hint: container_hint(fstype, &current.devnode),
                 });
@@ -167,7 +169,7 @@ fn unwrap_containers(
 
 fn container_hint(fstype: &str, devnode: &Path) -> String {
     match fstype {
-        "crypto_LUKS" | "BitLocker" => {
+        LUKS | "BitLocker" => {
             format!("unlock it first, e.g. `udisksctl unlock -b {}`", devnode.display())
         }
         "linux_raid_member" => "assemble the RAID array first (`mdadm --assemble`)".into(),

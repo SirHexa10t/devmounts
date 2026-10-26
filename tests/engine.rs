@@ -674,6 +674,222 @@ fn every_failed_unmount_is_reported_and_the_rest_still_tried() {
     assert_eq!(json["devices"][0]["mount_changes"][0]["error"]["kind"], "unmount_failed");
 }
 
+/// A locked LUKS container, `sdd1`, holding the ext4 filesystem `INSIDE` with `docs/` in it.
+/// Returns where the `mount` method will mount that filesystem — made ready, holding `docs/`.
+fn add_vault(s: &Setup) -> PathBuf {
+    let container = device("sdd1", 8, 49, "crypto_LUKS", "uuid-vault", None);
+    s.sys.add_locked(container, device("dm-0", 253, 0, "ext4", "uuid-inside", Some("INSIDE")));
+    let inside = s.mnt.join("uuid-inside");
+    mkdir(&inside, "docs");
+    inside
+}
+
+/// The vault by its container's UUID — what can be seen of it while it's locked.
+fn vault_config(s: &Setup, mounts: &str) -> Config {
+    s.config(&s.device("uuid = 'uuid-vault'", "vault", mounts))
+}
+
+/// A device in a locked LUKS container — its filesystem out of sight until the container is
+/// open — is reached by unlocking on the way, then mounted and linked as any other.
+#[test]
+fn a_locked_luks_container_is_unlocked_on_the_way_to_its_device() {
+    let s = Setup::new();
+    let inside = add_vault(&s);
+    let report = s.apply(&vault_config(&s, "docs = 'docs'"), &opts());
+    assert_eq!(*s.sys.calls.borrow(), ["unlock sdd1", "mount dm-0 [] top_level=false"]);
+    let device = &report.devices[0];
+    let unlocked = MountChange::Unlocked { container: "/dev/sdd1".into() };
+    assert_eq!(device.mount_changes, [unlocked, MountChange::Mounted { top_level: false }]);
+    assert_eq!(device.containers, ["/dev/sdd1 (crypto_LUKS)"]);
+    assert_eq!(outcomes(&report), pairs(&[("vault", "created"), ("docs", "created")]));
+    assert_eq!(read_link(&s.link("vault")), inside);
+    assert!(report.ok(), "{}", report.render(Colors::Plain));
+    assert!(report.render(Colors::Plain).contains("  unlocked /dev/sdd1\n  mounted it\n"));
+    let json = serde_json::to_value(&report).unwrap();
+    let change = &json["devices"][0]["mount_changes"][0];
+    assert_eq!(*change, serde_json::json!({"change": "unlocked", "container": "/dev/sdd1"}));
+}
+
+/// A dry run unlocks nothing: it says it would, and the links are what they'd be once the
+/// device in the container is mounted.
+#[test]
+fn a_dry_run_says_it_would_unlock() {
+    let s = Setup::new();
+    add_vault(&s);
+    let report = s.apply(&vault_config(&s, "docs = 'docs'"), &Options { dry_run: true, ..opts() });
+    assert!(s.sys.calls.borrow().is_empty());
+    let would = MountChange::WouldUnlock { container: "/dev/sdd1".into() };
+    assert_eq!(report.devices[0].mount_changes, [would]);
+    assert_eq!(outcomes(&report), pairs(&[("vault", "would_create"), ("docs", "would_create")]));
+    assert_eq!(report.devices[0].devmount.target, None, "not known before unlocking");
+    assert!(report.ok());
+    assert!(fs::read_dir(&s.root).unwrap().next().is_none(), "nothing linked");
+}
+
+/// Where the device may not be mounted — `automount = false`, or `--no-mount` — its container
+/// isn't unlocked either: the device's problem, saying how to unlock it.
+#[test]
+fn a_locked_container_stays_locked_where_mounting_is_off() {
+    let s = Setup::new();
+    add_vault(&s);
+    let off = s.config("[[device]]\nuuid = 'uuid-vault'\ndevmount = 'vault'\nautomount = false\n");
+    let refused = [
+        s.apply(&off, &opts()),
+        s.apply(&vault_config(&s, ""), &Options { no_mount: true, ..opts() }),
+    ];
+    for report in refused {
+        let error = report.devices[0].error.as_ref().expect("a problem");
+        assert_eq!(error.kind(), "inactive_container");
+        assert!(error.to_string().contains("udisksctl unlock -b /dev/sdd1"), "{error}");
+    }
+    assert!(s.sys.calls.borrow().is_empty());
+}
+
+/// An unlock that fails — a wrong passphrase, a refusal — is the device's problem, and nothing
+/// more is tried for it.
+#[test]
+fn a_failed_unlock_is_the_devices_problem() {
+    let mut s = Setup::new();
+    add_vault(&s);
+    s.sys.fail_unlocks = true;
+    let report = s.apply(&vault_config(&s, "docs = 'docs'"), &opts());
+    assert_eq!(report.devices[0].error.as_ref().map(Error::kind), Some("unlock_failed"));
+    assert_eq!(*s.sys.calls.borrow(), ["unlock sdd1"]);
+    assert!(report.devices[0].mount_changes.is_empty());
+    assert_eq!(outcomes(&report), pairs(&[("vault", "skipped"), ("docs", "skipped")]));
+}
+
+/// Only a LUKS container is unlocked: any other that isn't active (an LVM volume group, a RAID
+/// array) stays the device's problem, with its own hint.
+#[test]
+fn only_luks_containers_are_unlocked() {
+    let s = Setup::new();
+    s.sys.devices.borrow_mut().push(device("sde1", 8, 65, "LVM2_member", "uuid-pv", None));
+    let report = s.apply(&s.config(&s.device("uuid = 'uuid-pv'", "pv", "")), &opts());
+    let error = report.devices[0].error.as_ref().expect("a problem");
+    assert_eq!(error.kind(), "inactive_container");
+    assert!(error.to_string().contains("vgchange -ay"), "{error}");
+    assert!(s.sys.calls.borrow().is_empty());
+}
+
+/// `remove --unmount` locks the container again once the last mount of the device in it is
+/// down — the drive is then safe to unplug — leaving it as locked as it was found.
+#[test]
+fn remove_unmount_locks_the_container_once_its_last_mount_is_down() {
+    let s = Setup::new();
+    let inside = add_vault(&s);
+    let config = vault_config(&s, "docs = 'docs'");
+    assert!(s.apply(&config, &opts()).ok());
+    s.sys.calls.borrow_mut().clear();
+    let report = devmounts::remove(&config, &Options { unmount: true, ..opts() }, &s.sys).unwrap();
+    assert_eq!(
+        *s.sys.calls.borrow(),
+        [format!("unmount {}", inside.display()), "lock sdd1".to_owned()]
+    );
+    let locked = MountChange::Locked { container: "/dev/sdd1".into() };
+    assert_eq!(
+        report.devices[0].mount_changes,
+        [MountChange::Unmounted { mount_point: inside }, locked]
+    );
+    assert!(report.ok(), "{}", report.render(Colors::Plain));
+    let status = devmounts::status(&config, &opts(), &s.sys).unwrap();
+    assert_eq!(status.devices[0].error.as_ref().map(Error::kind), Some("inactive_container"));
+}
+
+/// A dry run says it would lock the container, as the unmounts it would make leave nothing.
+#[test]
+fn a_dry_run_says_it_would_lock() {
+    let s = Setup::new();
+    let inside = add_vault(&s);
+    let config = vault_config(&s, "");
+    assert!(s.apply(&config, &opts()).ok());
+    s.sys.calls.borrow_mut().clear();
+    let dry = Options { unmount: true, dry_run: true, ..opts() };
+    let report = devmounts::remove(&config, &dry, &s.sys).unwrap();
+    assert!(s.sys.calls.borrow().is_empty());
+    let would = MountChange::WouldLock { container: "/dev/sdd1".into() };
+    assert_eq!(
+        report.devices[0].mount_changes,
+        [MountChange::WouldUnmount { mount_point: inside }, would]
+    );
+}
+
+/// While the device in it is still mounted somewhere devmounts doesn't unmount (fstab's), the
+/// container stays open: left unlocked, with where it's still mounted — no problem, as a mount
+/// left alone is none.
+#[test]
+fn a_container_whose_device_stays_mounted_is_left_unlocked() {
+    let s = Setup::new();
+    add_vault(&s);
+    let config = vault_config(&s, "");
+    assert!(s.apply(&config, &opts()).ok());
+    let fixed = mkdir(&s.base, "fixed/INSIDE");
+    s.sys.add_mount("dm-0", "/", &fixed);
+    for dry_run in [true, false] {
+        let options = Options { unmount: true, dry_run, ..opts() };
+        let report = devmounts::remove(&config, &options, &s.sys).unwrap();
+        let changes = &report.devices[0].mount_changes;
+        let left = MountChange::LeftUnlocked {
+            container: "/dev/sdd1".into(),
+            mounted_at: vec![fixed.clone()],
+        };
+        assert!(changes.contains(&left), "dry run {dry_run}: {changes:?}");
+        assert!(report.ok());
+        let text = report.render(Colors::Plain);
+        assert!(
+            text.contains(&format!(
+                "left /dev/sdd1 unlocked: still mounted at {}",
+                fixed.display()
+            )),
+            "{text}"
+        );
+    }
+    assert!(
+        !s.sys.calls.borrow().iter().any(|call| call.starts_with("lock")),
+        "{:?}",
+        s.sys.calls.borrow()
+    );
+}
+
+/// Containers nested in each other come down innermost first: an outer one can't close while one
+/// it holds is open.
+#[test]
+fn nested_luks_containers_are_locked_innermost_first() {
+    let s = Setup::new();
+    let held = |mut d: devmounts::BlockDevice, by: &str| {
+        d.holders = vec![by.to_owned()];
+        d
+    };
+    s.sys.devices.borrow_mut().extend([
+        held(device("sdd1", 8, 49, "crypto_LUKS", "uuid-outer", None), "dm-0"),
+        held(device("dm-0", 253, 0, "crypto_LUKS", "uuid-inner", None), "dm-1"),
+        device("dm-1", 253, 1, "ext4", "uuid-inside", Some("INSIDE")),
+    ]);
+    let config = s.config(&s.device("uuid = 'uuid-outer'", "vault", ""));
+    let report = devmounts::remove(&config, &Options { unmount: true, ..opts() }, &s.sys).unwrap();
+    assert_eq!(*s.sys.calls.borrow(), ["lock dm-0", "lock sdd1"]);
+    let locked = |at: &str| MountChange::Locked { container: at.into() };
+    assert_eq!(report.devices[0].mount_changes, [locked("/dev/dm-0"), locked("/dev/sdd1")]);
+}
+
+/// A lock that fails is a problem of its own, as a failed unmount is.
+#[test]
+fn a_failed_lock_is_a_problem() {
+    let mut s = Setup::new();
+    add_vault(&s);
+    let config = vault_config(&s, "");
+    assert!(s.apply(&config, &opts()).ok());
+    s.sys.fail_locks = true;
+    let report = devmounts::remove(&config, &Options { unmount: true, ..opts() }, &s.sys).unwrap();
+    let failed = report.devices[0].mount_changes.last();
+    assert!(
+        matches!(failed, Some(MountChange::LockFailed { error, .. }) if error.kind() == "lock_failed"),
+        "{failed:?}"
+    );
+    assert_eq!(report.problems(), 1);
+    assert!(report.render(Colors::Plain).contains("✗ locking /dev/sdd1 failed: simulated"));
+}
+
 #[test]
 fn one_failing_device_does_not_stop_the_others() {
     let s = Setup::new();

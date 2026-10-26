@@ -17,7 +17,7 @@ use crate::config::{MountMethod, is_plain_absolute};
 use crate::error::{Error, Result};
 use crate::escalate;
 use crate::privileged::{Op, Privileges};
-use crate::system::{BlockDevice, MountRequest, UnmountRequest};
+use crate::system::{BlockDevice, ContainerRequest, MountRequest, UnmountRequest};
 
 /// Directories udisks2 and similar automounters mount into ([`LinuxSystem`](crate::LinuxSystem)'s
 /// default `automount_dirs`).
@@ -152,6 +152,38 @@ fn udisksctl_missing() -> Option<String> {
         .then(|| "udisks2 isn't installed (from `udisksctl`)".to_owned())
 }
 
+/// Opens a locked LUKS container with udisks2, which asks for the passphrase itself: on the
+/// terminal, where the command runs ([`escalate::run_on_terminal`]), so the passphrase never
+/// passes through devmounts.
+pub fn unlock(request: &ContainerRequest<'_>) -> Result<()> {
+    let container = &request.container.devnode;
+    let fail = |message: String| Error::UnlockFailed { container: container.clone(), message };
+    if let Some(why) = udisksctl_missing() {
+        return Err(fail(format!("{why}; open it yourself first")));
+    }
+    let polkit = Polkit::of(request.method);
+    escalate::run_on_terminal(&udisks_unlock_argv(container, polkit)).map_err(|err| {
+        let ask = match polkit {
+            Polkit::MustNotAsk => {
+                "; if it wanted an administrator's password, `mount_method = \"udisks\"` lets it ask"
+            }
+            Polkit::MayAsk => "",
+        };
+        fail(format!("{} — its reason is above{ask}", inner_message(err)))
+    })
+}
+
+/// Closes a LUKS container with udisks2 again.
+pub fn lock(request: &ContainerRequest<'_>) -> Result<()> {
+    let container = &request.container.devnode;
+    let fail = |message: String| Error::LockFailed { container: container.clone(), message };
+    if let Some(why) = udisksctl_missing() {
+        return Err(fail(why));
+    }
+    escalate::run(&udisks_lock_argv(container, Polkit::of(request.method)))
+        .map_err(|err| fail(inner_message(err)))
+}
+
 /// `udisksctl mount --block-device <device> [--options <options>] [--no-user-interaction]`.
 pub fn udisks_mount_argv(device: &Path, options: &[String], polkit: Polkit) -> Vec<OsString> {
     let mut argv = os_args(["udisksctl", "mount", "--block-device"]);
@@ -166,7 +198,23 @@ pub fn udisks_mount_argv(device: &Path, options: &[String], polkit: Polkit) -> V
 
 /// `udisksctl unmount --block-device <device> [--no-user-interaction]`.
 pub fn udisks_unmount_argv(device: &Path, polkit: Polkit) -> Vec<OsString> {
-    let mut argv = os_args(["udisksctl", "unmount", "--block-device"]);
+    udisks_device_argv("unmount", device, polkit)
+}
+
+/// `udisksctl unlock --block-device <container> [--no-user-interaction]`.
+pub fn udisks_unlock_argv(container: &Path, polkit: Polkit) -> Vec<OsString> {
+    udisks_device_argv("unlock", container, polkit)
+}
+
+/// `udisksctl lock --block-device <container> [--no-user-interaction]`.
+pub fn udisks_lock_argv(container: &Path, polkit: Polkit) -> Vec<OsString> {
+    udisks_device_argv("lock", container, polkit)
+}
+
+/// `udisksctl <verb> --block-device <device> [--no-user-interaction]`: every udisks2 step but a
+/// mount, which takes options too.
+fn udisks_device_argv(verb: &str, device: &Path, polkit: Polkit) -> Vec<OsString> {
+    let mut argv = os_args(["udisksctl", verb, "--block-device"]);
     argv.push(device.into());
     argv.extend(no_interaction(polkit));
     argv
@@ -372,6 +420,22 @@ mod tests {
         assert_eq!(
             words(udisks_unmount_argv(dev, Polkit::MayAsk)),
             ["udisksctl", "unmount", "--block-device", "/dev/sdb1"]
+        );
+        assert_eq!(
+            words(udisks_unlock_argv(dev, Polkit::MustNotAsk)),
+            ["udisksctl", "unlock", "--block-device", "/dev/sdb1", "--no-user-interaction"]
+        );
+        assert_eq!(
+            words(udisks_unlock_argv(dev, Polkit::MayAsk)),
+            ["udisksctl", "unlock", "--block-device", "/dev/sdb1"]
+        );
+        assert_eq!(
+            words(udisks_lock_argv(dev, Polkit::MustNotAsk)),
+            ["udisksctl", "lock", "--block-device", "/dev/sdb1", "--no-user-interaction"]
+        );
+        assert_eq!(
+            words(udisks_lock_argv(dev, Polkit::MayAsk)),
+            ["udisksctl", "lock", "--block-device", "/dev/sdb1"]
         );
         assert_eq!(
             words(mount_argv(dev, Path::new("/run/devmounts/u"), &opts)),

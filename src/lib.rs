@@ -54,4 +54,6 @@ pub use report::{
 pub use resolve::{
     Location, MountTree, ResolvedDevice, check_target, device_mounts, find_device, locate,
 };
-pub use system::{BlockDevice, LinuxSystem, MountRequest, System, UnmountRequest};
+pub use system::{
+    BlockDevice, ContainerRequest, LinuxSystem, MountRequest, System, UnmountRequest,
+};

@@ -3,9 +3,10 @@
 mod common;
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use common::{mkdir, tmpdir};
 use tempfile::TempDir;
@@ -75,7 +76,12 @@ impl Fixture {
 
     /// Runs the binary with nothing but `bin` ([`fake_commands`]) as its `PATH`.
     fn run_with(&self, bin: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_devmounts"))
+        self.run_typing(bin, args, "")
+    }
+
+    /// [`run_with`](Self::run_with), with `typed` as what the terminal gives it.
+    fn run_typing(&self, bin: &Path, args: &[&str], typed: &str) -> Output {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_devmounts"))
             .args(args)
             .env_clear()
             .env("PATH", bin)
@@ -86,8 +92,29 @@ impl Fixture {
             .env("DEVMOUNTS_AUTOMOUNT_DIRS", self.base.join("media"))
             .env("DEVMOUNTS_TEST_LOG", self.command_log())
             .env("NO_COLOR", "1")
-            .output()
-            .unwrap()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(typed.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// A second device, `sdb2`: a locked LUKS container (UUID `luks-1`). What unlocking it opens,
+    /// `dm-0`, is in the kernel's list already, but neither stacked on it nor identified: the
+    /// stand-in `udisksctl unlock` does both, as unlocking would.
+    fn add_vault(&self) {
+        let block = mkdir(&self.base, "sys/class/block/sdb2");
+        fs::write(block.join("dev"), "8:18\n").unwrap();
+        fs::write(block.join("uevent"), "DEVNAME=sdb2\n").unwrap();
+        fs::write(block.join("partition"), "2\n").unwrap();
+        mkdir(&block, "holders");
+        fs::write(self.base.join("udev/b8:18"), "E:ID_FS_TYPE=crypto_LUKS\nE:ID_FS_UUID=luks-1\n")
+            .unwrap();
+        let inside = mkdir(&self.base, "sys/class/block/dm-0");
+        fs::write(inside.join("dev"), "253:0\n").unwrap();
+        fs::write(inside.join("uevent"), "DEVNAME=dm-0\n").unwrap();
     }
 
     /// The commands [`fake_commands`] were run with, one per line.
@@ -241,10 +268,12 @@ fn lists_devices() {
 }
 
 /// Stand-ins for every command devmounts runs, each logging its arguments to `$DEVMOUNTS_TEST_LOG`,
-/// in a directory that will be the whole `PATH` (the real commands can't be reached): `udisksctl`
-/// refusing for want of a password, as for an internal drive; a `sudo` that just runs what it's
-/// given; and a `mount`/`umount` that put the mount into, and take it out of, the fixture's
-/// mountinfo.
+/// in a directory that will be the whole `PATH` (the real commands can't be reached), so they
+/// make do with the shell's builtins: `udisksctl`, refusing to mount for want of a password, as
+/// for an internal drive, and unlocking as udisksctl does — asking for the passphrase on stdout,
+/// reading it from stdin (`secret` opens it) — by stacking `dm-0` on the container in the
+/// fixture's sysfs; a `sudo` that just runs what it's given; and a `mount`/`umount` that put the
+/// mount into, and take it out of, the fixture's mountinfo.
 fn fake_commands(f: &Fixture) -> PathBuf {
     let bin = mkdir(&f.base, "bin");
     let script = |name: &str, body: &str| {
@@ -258,7 +287,21 @@ fn fake_commands(f: &Fixture) -> PathBuf {
     };
     script(
         "udisksctl",
-        "[ \"$1\" = status ] && exit 0\n\
+        "case \"$1\" in\n\
+         status) exit 0 ;;\n\
+         unlock)\n\
+             printf 'Passphrase: '\n\
+             read -r passphrase\n\
+             if [ \"$passphrase\" != secret ]; then\n\
+                 echo \"Error unlocking $3: Failed to activate device: Operation not permitted\" >&2\n\
+                 exit 1\n\
+             fi\n\
+             : > \"$DEVMOUNTS_SYSFS/class/block/${3##*/}/holders/dm-0\"\n\
+             printf 'E:ID_FS_TYPE=ext4\\nE:ID_FS_UUID=fs-1\\nE:ID_FS_LABEL=INSIDE\\n' > \"$DEVMOUNTS_UDEV_DATA/b253:0\"\n\
+             echo \"Unlocked $3 as /dev/dm-0.\"\n\
+             exit 0 ;;\n\
+         lock) echo \"Locked $3.\"; exit 0 ;;\n\
+         esac\n\
          echo 'Error mounting: GDBus.Error:org.freedesktop.UDisks2.Error.NotAuthorizedCanObtain: Not authorized' >&2\n\
          exit 1\n",
     );
@@ -266,7 +309,8 @@ fn fake_commands(f: &Fixture) -> PathBuf {
     script(
         "mount",
         "while [ \"$1\" != -- ]; do shift; done\n\
-         printf '31 1 8:17 / %s rw - ext4 %s rw\\n' \"$3\" \"$2\" >> \"$DEVMOUNTS_MOUNTINFO\"\n",
+         read -r devnum < \"$DEVMOUNTS_SYSFS/class/block/${2##*/}/dev\"\n\
+         printf '31 1 %s / %s rw - ext4 %s rw\\n' \"$devnum\" \"$3\" \"$2\" >> \"$DEVMOUNTS_MOUNTINFO\"\n",
     );
     script(
         "umount",
@@ -420,4 +464,105 @@ fn with_the_udisks_method_an_automounters_mount_comes_down_through_udisks2_alone
         f.commands_run(),
         [format!("udisksctl unmount --block-device {}", devnode.display())]
     );
+}
+
+/// A device in a locked LUKS container, end to end. udisksctl unlocks it, asking for the
+/// passphrase itself on the terminal — its prompt on stderr, never in the report on stdout, its
+/// answer read from stdin. The device list, read again, shows what it opened, and that is mounted
+/// and linked; `remove --unmount` then locks it again once its last mount is down.
+#[test]
+fn a_luks_device_is_unlocked_asking_on_the_terminal_and_locked_again() {
+    if devmounts::escalate::is_root() {
+        return; // root mounts directly: no helper
+    }
+    let f = Fixture::new();
+    f.unmount_all();
+    f.add_vault();
+    let bin = fake_commands(&f);
+    let mnt = mkdir(&f.base, "mnt");
+    mkdir(&mnt, "fs-1/docs"); // what the opened filesystem will show
+    let config = f.config(&format!(
+        "settings.mount_base = {mnt:?}\n[[device]]\nuuid = 'luks-1'\ndevmount = 'v'\nmounts = {{ docs = 'docs' }}\n"
+    ));
+    let (config, root) = (config.to_str().unwrap(), f.root.to_str().unwrap());
+    let sudo = bin.join("sudo");
+    let tail = ["--root", root, "--escalate", sudo.to_str().unwrap()];
+
+    let applied =
+        f.run_typing(&bin, &[&["apply", "--json", config][..], &tail].concat(), "secret\n");
+    assert_eq!(applied.status.code(), Some(0), "{}{}", stdout(&applied), stderr(&applied));
+    let report: serde_json::Value =
+        serde_json::from_slice(&applied.stdout).expect("stdout is the report, and only it");
+    let (vault, inside) = (f.base.join("dev/sdb2"), f.base.join("dev/dm-0"));
+    let changes = &report["devices"][0]["mount_changes"];
+    assert_eq!(changes[0], serde_json::json!({"change": "unlocked", "container": vault}));
+    assert_eq!(changes[1], serde_json::json!({"change": "mounted", "top_level": false}));
+    let asked = stderr(&applied);
+    assert!(
+        asked.contains("Passphrase: ") && asked.contains("Unlocked "),
+        "udisksctl's own words, on stderr: {asked}"
+    );
+    assert_eq!(fs::read_link(f.root.join("v")).unwrap(), mnt.join("fs-1"));
+    assert_eq!(fs::read_link(f.root.join("docs")).unwrap(), f.root.join("v/docs"));
+
+    let removed = f.run_with(&bin, &[&["remove", "--unmount", config][..], &tail].concat());
+    assert_eq!(removed.status.code(), Some(0), "{}{}", stdout(&removed), stderr(&removed));
+    assert!(
+        stdout(&removed).contains(&format!("locked {}", vault.display())),
+        "{}",
+        stdout(&removed)
+    );
+
+    let helper = format!("sudo {} --devmounts-privileged-helper", env!("CARGO_BIN_EXE_devmounts"));
+    assert_eq!(
+        f.commands_run(),
+        [
+            format!("udisksctl unlock --block-device {} --no-user-interaction", vault.display()),
+            "udisksctl status".to_owned(),
+            format!("udisksctl mount --block-device {} --no-user-interaction", inside.display()),
+            helper.clone(),
+            format!("mount -- {} {}", inside.display(), mnt.join("fs-1").display()),
+            helper,
+            format!("umount -- {}", mnt.join("fs-1").display()),
+            format!("udisksctl lock --block-device {} --no-user-interaction", vault.display()),
+        ]
+    );
+}
+
+/// A refused passphrase is the device's problem: the report says unlocking failed, udisksctl's own
+/// reason having been shown on the terminal, and nothing more is done for it.
+#[test]
+fn a_refused_passphrase_unlocks_nothing_and_says_so() {
+    let f = Fixture::new();
+    f.unmount_all();
+    f.add_vault();
+    let bin = fake_commands(&f);
+    let config = f.config("[[device]]\nuuid = 'luks-1'\ndevmount = 'v'\n");
+    let args = [
+        "apply",
+        config.to_str().unwrap(),
+        "--root",
+        f.root.to_str().unwrap(),
+        "--escalate",
+        "none",
+    ];
+    let out = f.run_typing(&bin, &args, "wrong\n");
+    assert_eq!(out.status.code(), Some(1), "{}{}", stdout(&out), stderr(&out));
+    let vault = f.base.join("dev/sdb2");
+    let text = stdout(&out);
+    assert!(
+        text.contains(&format!("✗ unlocking {} failed: exit status: 1", vault.display())),
+        "{text}"
+    );
+    assert!(text.contains("its reason is above"), "{text}");
+    assert!(
+        stderr(&out).contains("Error unlocking"),
+        "udisksctl's reason, on the terminal: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        f.commands_run(),
+        [format!("udisksctl unlock --block-device {} --no-user-interaction", vault.display())]
+    );
+    assert!(!f.root.join("v").exists());
 }
